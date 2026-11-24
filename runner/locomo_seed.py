@@ -47,6 +47,7 @@ _STOPWORDS = {
     "that", "this", "from", "have", "had", "has", "did", "does", "how", "why",
     "about", "into", "its", "our", "your", "their", "they", "then", "than",
     "after", "before", "first", "last", "been", "are", "not", "you", "his", "her",
+    "would", "could", "should", "likely", "pursue",
 }
 
 # Split only on discourse boundaries, so fragments stay real substrings of the
@@ -284,22 +285,21 @@ def recall_question(
                 seen.add(name)
                 found.append(name)
 
+    # Do NOT stop the form sweep on sufficiency: the first 6 hits are often all
+    # from one session (e.g. generic "melanie"/"caroline" turns) while the
+    # answer-bearing turn needs a decisive single term ("sunrise", "painted").
+    # Run every gold-free form, then neighbour expansion, so those turns surface.
     for form in ordered:
         try:
             absorb(recall(form, limit))
         except Exception:
             continue
-        if _sufficient(found):
-            break
 
-    if not _sufficient(found):
-        for query in _neighbour_queries(found):
-            try:
-                absorb(recall(query, limit))
-            except Exception:
-                continue
-            if _sufficient(found):
-                break
+    for query in _neighbour_queries(found):
+        try:
+            absorb(recall(query, limit))
+        except Exception:
+            continue
     return found
 
 
