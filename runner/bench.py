@@ -16,6 +16,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -579,6 +580,53 @@ def _vault_remember(bin_path: Path | None, cli_root: Path | None, vault: Path, e
     return bool(result.get("ok")) and "error" not in result
 
 
+def _vault_remember_stamped(
+    bin_path: Path | None, cli_root: Path | None, vault: Path, entity: str, text: str
+) -> tuple[bool, Any]:
+    """Remember a fact and return the CLI's own recorded_at transaction time."""
+    result = mn_json.run_verb(
+        "vault",
+        ["remember", _entity_name(entity), text[:2000], "--vault", str(vault)],
+        bin_path,
+        timeout=30.0,
+        cwd=cli_root,
+    )
+    if not result.get("ok") or "error" in result:
+        return False, None
+    data = result.get("data") or {}
+    return True, data.get("recorded_at") or data.get("at")
+
+
+def _norm(text: Any) -> str:
+    return " ".join(str(text or "").split()).casefold()
+
+
+def _cap(items: list[Any], max_cases: int | None) -> list[Any]:
+    """Same slicing rule as the harness limiter: none or 0 means no truncation."""
+    if max_cases is None or isinstance(max_cases, bool) or not isinstance(max_cases, int) or max_cases <= 0:
+        return list(items)
+    return list(items)[:max_cases]
+
+
+def selection_for_lane(lane: str, module: Any, max_cases: int | None) -> dict[str, Any]:
+    """Pin the lane's subset before capping; never let SH stand in for MH."""
+    selection = dict(module.select(max_cases))
+    if lane != "memoryagentbench-mh":
+        return selection
+    all_configurations = (module.select(None) or {}).get("configurations") or []
+    mh = [
+        item
+        for item in all_configurations
+        if isinstance(item, dict) and str(item.get("subset") or "").upper() == "MH"
+    ]
+    capped = _cap(mh, max_cases)
+    selection["configurations"] = capped
+    selection["effective_denominator"] = len(capped)
+    selection["selected_subset"] = "MH"
+    selection["subset_filter_applied_before_cap"] = True
+    return selection
+
+
 def _vault_recall(
     bin_path: Path | None, cli_root: Path | None, vault: Path, query: str, limit: int
 ) -> list[str]:
@@ -692,6 +740,10 @@ def _build_mab_rows(
             continue
         attempted += 1
         subset = str(configuration.get("subset") or "").upper()
+        expected_subset = str(selection.get("selected_subset") or "").upper()
+        if expected_subset and subset != expected_subset:
+            failures.append(f"wrong subset {subset}; lane requires {expected_subset}")
+            continue
         candidates = by_subset.get(subset, [])
         if not candidates:
             failures.append(f"{subset}: no pinned dataset row")
@@ -721,21 +773,32 @@ def _build_mab_rows(
         older_serial, newer_serial = sorted(matching)[-2:]
         older_text = dict(facts)[older_serial]
         newer_text = dict(facts)[newer_serial]
+        if _SERIAL.search(older_text) or _SERIAL.search(newer_text):
+            failures.append(f"{subset}: pinned fact text already carries a serial marker")
+            continue
+        # The serial is metadata only. It is never written into the recallable
+        # answer text: the system must pick the current fact from its own
+        # version/ordering signal (asof), and we map that text back to the
+        # pinned fact index afterwards.
+        text_to_serial = {_norm(older_text): older_serial, _norm(newer_text): newer_serial}
         case_id = f"fc-{subset.lower()}-{ordinal}-{question_index + 1}"
         with tempfile.TemporaryDirectory(prefix="mn-bench-mab-") as temporary:
             vault = Path(temporary) / "vault.db"
-            writes_ok = _vault_remember(
-                bin_path, cli_root, vault, case_id, f"serial {older_serial}: {older_text}"
-            ) and _vault_remember(
-                bin_path, cli_root, vault, case_id, f"serial {newer_serial}: {newer_text}"
+            older_ok, older_time = _vault_remember_stamped(
+                bin_path, cli_root, vault, case_id, older_text
             )
-            observed = _vault_asof(bin_path, cli_root, vault, case_id) if writes_ok else []
+            time.sleep(0.01)  # distinct valid_from for the two observations
+            newer_ok, newer_time = _vault_remember_stamped(
+                bin_path, cli_root, vault, case_id, newer_text
+            )
+            observed = _vault_asof(bin_path, cli_root, vault, case_id) if older_ok and newer_ok else []
         if not observed:
             failures.append(f"{case_id}: no recall observation")
             continue
-        match = _SERIAL.search(observed[-1])
-        if match is None:
-            failures.append(f"{case_id}: recalled fact had no serial")
+        current = observed[-1]  # asof's own current fact, ordered by valid_from
+        predicted = text_to_serial.get(_norm(current))
+        if predicted is None:
+            failures.append(f"{case_id}: recalled text did not map to a pinned fact")
             continue
         rows.append(
             {
@@ -744,10 +807,17 @@ def _build_mab_rows(
                 "context_tokens": int(configuration.get("context_tokens") or 4096),
                 "update_type": "rewrite" if older_serial != newer_serial else "true",
                 "gold_serial": str(newer_serial),
-                "pred_serial": match.group(1),
+                "pred_serial": str(predicted),
                 "gold_answer": " ".join(str(item) for item in gold_answers)[:300],
-                "pred_answer": observed[-1][:300],
+                "pred_answer": current[:300],
                 "gold_derivation": "largest pinned fact index containing a gold answer",
+                "pred_derivation": "system asof ordering mapped back to pinned fact text; no serial in fact text",
+                "serial_signal": {
+                    "kind": "transaction_time_valid_from",
+                    "older_recorded_at": older_time,
+                    "newer_recorded_at": newer_time,
+                    "serial_embedded_in_fact_text": False,
+                },
             }
         )
     return rows, attempted, failures
@@ -909,6 +979,8 @@ def _synthetic_rows(lane: str, selection: dict[str, Any]) -> list[dict[str, Any]
                 "pred_serial": f"S-{index + 1}" if index % 2 == 0 else "S-stale",
                 "gold_answer": f"synthetic answer {index + 1}",
                 "pred_answer": f"synthetic answer {index + 1}",
+                "fact_text": "synthetic fact text without any serial marker",
+                "serial_embedded_in_fact_text": False,
             }
             for index, item in enumerate(configurations)
         ]
@@ -959,7 +1031,7 @@ def model_lane_result(
     }
     try:
         preparation = prepare_for_lane(lane, dry_run=dry_run)
-        selection = module.select(args.max_cases)
+        selection = selection_for_lane(lane, module, args.max_cases)
     except (LaneBlocked, ValueError, OSError) as exc:
         result = base_envelope(SCHEMA_RESULT, **common)
         result.update(
@@ -974,6 +1046,29 @@ def model_lane_result(
         return result
 
     total = int(selection.get("effective_denominator") or 0)
+    if total == 0:
+        result = base_envelope(SCHEMA_RESULT, **common)
+        result.update(
+            {
+                "status": "blocked",
+                "gate": "fail",
+                "reason": "selection produced no cases for the requested lane subset",
+                "preparation": preparation,
+                "selection": {
+                    "effective_denominator": 0,
+                    "selected_subset": selection.get("selected_subset"),
+                },
+                "denominators": {
+                    "cases_total": 0,
+                    "cases_attempted": 0,
+                    "cases_scored": 0,
+                    "cases_failed": 0,
+                    "official_split": False,
+                },
+                "limitation": "No cases, no score; an empty slice is never substituted with another subset.",
+            }
+        )
+        return result
     if dry_run:
         rows = _synthetic_rows(lane, selection)
         attempted, failures = len(rows), []
@@ -1031,6 +1126,10 @@ def model_lane_result(
             "preparation": preparation,
             "selection": {
                 "effective_denominator": total,
+                "selected_subset": selection.get("selected_subset"),
+                "subset_filter_applied_before_cap": bool(
+                    selection.get("subset_filter_applied_before_cap", False)
+                ),
                 "planned_denominator": selection.get("planned_denominator"),
                 "official_split": bool(selection.get("official_split", False)),
                 "ids_pinned": bool(selection.get("ids_pinned", False)),
@@ -1041,7 +1140,15 @@ def model_lane_result(
                 "dataset_url": getattr(module, "DATASET_URL", None),
                 "dataset_sha256": getattr(module, "DATASET_SHA256", None),
             },
+            "adaptation_note": (
+                "Serial-to-transaction-time mapping is a derived diagnostic, not the "
+                "paper's native SubEM @6K/32K; figures are context only."
+                if lane == "memoryagentbench-mh"
+                else None
+            ),
             "cases": case_records,
+            "synthetic_rows": _strip_percent_literals(rows) if dry_run else [],
+            "observation_rows": _strip_percent_literals(rows) if not dry_run else [],
             "denominators": {
                 "cases_total": total,
                 "cases_attempted": attempted,
