@@ -8,6 +8,7 @@ denominators; no bare percentages and no ranking language are emitted.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import importlib
 import json
@@ -17,6 +18,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -51,6 +54,18 @@ MODEL_LANES: tuple[str, ...] = (
     "locomo-small",
 )
 ALL_RUN_LANES: tuple[str, ...] = (*MODEL_LANES, "mcp-stdio")
+
+# Hard concurrency ceiling. Independent CLI calls are fanned out in threads;
+# each case's own remember -> recall -> asof chain stays sequential.
+MAX_WORKERS = 8
+
+# Pinned reader for the LoCoMo lane. Kilo's OpenAI-compatible gateway serves a
+# free, non-reasoning model that returns a short final answer. The key is read
+# from the environment and never logged; no answer is fabricated if it fails.
+READER_PROVIDER = "kilo"
+READER_MODEL = "baidu/ernie-5.5-flash-preview:free"
+READER_BASE_URL = "https://ai-gateway.kilo.ai/api/v1"
+READER_SYSTEM_PROMPT = "Answer with only the exact value from the provided facts; if absent, say UNSUPPORTED."
 
 _PERCENT = re.compile(r"(?<![\w])(\d+(?:\.\d+)?)\s*%")
 
@@ -183,19 +198,29 @@ def estimated_spend(
     else:
         total = pins.get("locomo", {}).get("questions")
     count = max_cases if max_cases is not None else total
+    bounded = count if isinstance(count, int) else None
+    if lane == "locomo-small":
+        basis = (
+            "Reader: pinned free Kilo model " + READER_MODEL + " answers from "
+            "CLI-recalled facts, at most one call per case (capped by max_cases); "
+            "no generation model and no OpenAI judge call. No amount is asserted."
+        )
+        calls = {"generation_max": 0, "judge_max": 0, "reader_max": bounded}
+        keys = ["KILO_API_KEY"]
+    else:
+        basis = (
+            "BYOK: your provider bills generation and OPENAI_API_KEY bills judging. "
+            "No price table is embedded here; no amount is asserted."
+        )
+        calls = {"generation_max": bounded, "judge_max": bounded}
+        keys = ["KILO_API_KEY", "OPENAI_API_KEY"]
     return {
         "currency": "USD",
         "amount_usd": None,
         "amount_asserted": False,
-        "basis": (
-            "BYOK: your provider bills generation and OPENAI_API_KEY bills judging. "
-            "No price table is embedded here; no amount is asserted."
-        ),
-        "calls": {
-            "generation_max": count if isinstance(count, int) else None,
-            "judge_max": count if isinstance(count, int) else None,
-        },
-        "key_names_required": ["KILO_API_KEY", "OPENAI_API_KEY"],
+        "basis": basis,
+        "calls": calls,
+        "key_names_required": keys,
     }
 
 
@@ -564,7 +589,10 @@ def _match_known(name: str, known: list[str]) -> str | None:
     candidate = _entity_name(name)
     for value in known:
         needle = _entity_name(value)
-        if needle and (candidate == needle or candidate.startswith(needle + "-") or needle in candidate):
+        # Require an exact entity or a token boundary after the known ID.
+        # A loose substring test maps session_13-u10-* onto session_1 and
+        # reports a retrieved session ID the CLI never returned.
+        if needle and (candidate == needle or candidate.startswith(needle + "-")):
             return value
     return None
 
@@ -606,6 +634,70 @@ def _cap(items: list[Any], max_cases: int | None) -> list[Any]:
     if max_cases is None or isinstance(max_cases, bool) or not isinstance(max_cases, int) or max_cases <= 0:
         return list(items)
     return list(items)[:max_cases]
+
+
+def _parallel_map(func: Any, items: Any, workers: int) -> list[Any]:
+    """Apply ``func`` in parallel, capped at 8 workers, preserving input order.
+
+    Only independent CLI calls go through here. Each case's causally dependent
+    chain (seed -> recall -> asof -> reader) stays inside one worker.
+    """
+    values = list(items)
+    if not values:
+        return []
+    count = max(1, min(int(workers or 1), MAX_WORKERS))
+    if count == 1:
+        return [func(item) for item in values]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
+        return list(pool.map(func, values))
+
+
+def _reader_answer(question: str, facts: list[str], api_key: str) -> tuple[str | None, str | None]:
+    """Answer a question using ONLY the question and CLI-recalled fact texts.
+
+    No gold answer, gold evidence ID, dataset label or speaker hint is sent.
+    Returns (answer, None) or (None, short error code); never logs the key or
+    the raw HTTP body.
+    """
+    fact_block = "\n".join(f"- {str(fact)[:800]}" for fact in facts[:20])
+    payload = {
+        "model": READER_MODEL,
+        "messages": [
+            {"role": "system", "content": READER_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": f"Question: {str(question)[:1000]}\nFacts:\n{fact_block}",
+            },
+        ],
+        "temperature": 0,
+        "max_tokens": 256,
+    }
+    request = urllib.request.Request(
+        READER_BASE_URL + "/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": "Bearer " + api_key,
+            "Content-Type": "application/json",
+        },
+    )
+    for attempt in (0, 1):
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                data = json.loads(response.read().decode("utf-8", "replace"))
+            choices = data.get("choices") or []
+            message = choices[0].get("message") if choices else None
+            answer = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(answer, str) or not answer.strip():
+                return None, "reader_empty_answer"
+            return answer.strip()[:300], None
+        except urllib.error.HTTPError as exc:
+            if exc.code in (429, 500, 502, 503) and attempt == 0:
+                time.sleep(1.0)
+                continue
+            return None, f"reader_http_{exc.code}"
+        except Exception as exc:
+            return None, f"reader_error_{type(exc).__name__}"
+    return None, "reader_unavailable"
 
 
 def _interleave_contexts(
@@ -706,7 +798,10 @@ def _recall_question(
     for count in (3, 2, 1):
         if len(terms) >= count:
             queries.append(" ".join(terms[:count]))
-    for term in terms[:6]:
+    # Try every keyword, not only the first few: in a long temporal question the
+    # decisive term is often late in the token order. Each candidate below is
+    # still a real CLI recall call; no session ID is invented by this sweep.
+    for term in dict.fromkeys(terms):
         queries.append(term)
     seen: set[str] = set()
     found: list[str] = []
@@ -850,6 +945,7 @@ def _build_mab_rows(
         if not facts or not questions:
             failures.append(f"{subset}: no facts or questions in pinned row")
             continue
+        context_tokens = int(configuration.get("context_tokens") or 4096)
         ordinal = int(configuration.get("ordinal") or 1)
         question_index = (ordinal - 1) % len(questions)
         gold_answers = answers[question_index] if question_index < len(answers) else []
@@ -874,7 +970,9 @@ def _build_mab_rows(
         # version/ordering signal (asof), and we map that text back to the
         # pinned fact index afterwards.
         text_to_serial = {_norm(older_text): older_serial, _norm(newer_text): newer_serial}
-        case_id = f"fc-{subset.lower()}-{ordinal}-{question_index + 1}"
+        # The same ordinal repeats in every context bucket. Namespace the ID by
+        # context so per-case identity is unique while denominators stay as-is.
+        case_id = f"fc-{subset.lower()}-{ordinal}-{question_index + 1}@{context_tokens}"
         with tempfile.TemporaryDirectory(prefix="mn-bench-mab-") as temporary:
             vault = Path(temporary) / "vault.db"
             older_ok, older_time = _vault_remember_stamped(
@@ -897,7 +995,7 @@ def _build_mab_rows(
             {
                 "case_id": case_id,
                 "subset": subset,
-                "context_tokens": int(configuration.get("context_tokens") or 4096),
+                "context_tokens": context_tokens,
                 "update_type": "rewrite" if older_serial != newer_serial else "true",
                 "gold_serial": str(newer_serial),
                 "pred_serial": str(predicted),
@@ -916,14 +1014,78 @@ def _build_mab_rows(
     return rows, attempted, failures
 
 
+def _build_lme_case(
+    record: dict[str, Any],
+    question_type: str,
+    bin_path: Path | None,
+    cli_root: Path | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """One independent LME case: seed a private vault, recall, map session IDs."""
+    question_id = str(record.get("question_id") or "")
+    session_ids = [
+        str(value) for value in (record.get("haystack_session_ids") or []) if value is not None
+    ]
+    sessions = record.get("haystack_sessions") or []
+    if not question_id or not session_ids:
+        return None, f"{question_id}: missing question or session IDs"
+    with tempfile.TemporaryDirectory(prefix="mn-bench-lme-") as temporary:
+        vault = Path(temporary) / "vault.db"
+        writes_ok = True
+        for index, session_id in enumerate(session_ids):
+            turns = [
+                turn
+                for turn in (sessions[index] if index < len(sessions) else [])
+                if isinstance(turn, dict) and str(turn.get("content") or "").strip()
+            ]
+            user_text = " ".join(
+                str(turn.get("content") or "")
+                for turn in turns
+                if turn.get("role") == "user"
+            )
+            # Entity name is derived from haystack text only. Seed one fact per
+            # utterance: a question may use wording from a single assistant turn.
+            seed_text = user_text or " ".join(str(turn.get("content") or "") for turn in turns)
+            entity = f"{session_id}-{_slug(seed_text)}"
+            if turns:
+                for turn in turns:
+                    writes_ok = _vault_remember(
+                        bin_path, cli_root, vault, entity, str(turn["content"])
+                    ) and writes_ok
+            else:
+                writes_ok = _vault_remember(
+                    bin_path, cli_root, vault, entity, session_id
+                ) and writes_ok
+        ranked = _recall_question(bin_path, cli_root, vault, str(record.get("question") or ""), 10) if writes_ok else []
+    matched: list[str] = []
+    for name in ranked:
+        session_id = _match_known(name, session_ids)
+        if session_id is not None and session_id not in matched:
+            matched.append(session_id)
+    if not matched:
+        return None, f"{question_id}: no recall observation"
+    return (
+        {
+            "question_id": question_id,
+            "question_type": question_type,
+            "answer_session_ids": [str(value) for value in (record.get("answer_session_ids") or [])],
+            "retrieved_session_ids": matched,
+            "answer": str(record.get("answer") or "")[:300],
+        },
+        None,
+    )
+
+
 def _build_lme_rows(
     selection: dict[str, Any],
     dataset: Any,
     bin_path: Path | None,
     cli_root: Path | None,
+    workers: int = MAX_WORKERS,
+    reader_key: str | None = None,  # model-free lane; unused
 ) -> tuple[list[dict[str, Any]], int, list[str]]:
-    module = adapter_for("longmemeval-temporal")
-    question_type = getattr(module, "QUESTION_TYPE_FILTER", "temporal-reasoning")
+    question_type = getattr(
+        adapter_for("longmemeval-temporal"), "QUESTION_TYPE_FILTER", "temporal-reasoning"
+    )
     records = [
         item for item in dataset if isinstance(item, dict) and item.get("question_type") == question_type
     ]
@@ -935,53 +1097,93 @@ def _build_lme_rows(
     else:
         selected = records[: int(selection.get("effective_denominator") or 0)]
 
-    rows: list[dict[str, Any]] = []
-    failures: list[str] = []
-    attempted = 0
-    for record in selected:
-        attempted += 1
-        question_id = str(record.get("question_id") or "")
-        session_ids = [
-            str(value) for value in (record.get("haystack_session_ids") or []) if value is not None
-        ]
-        sessions = record.get("haystack_sessions") or []
-        if not question_id or not session_ids:
-            failures.append(f"{question_id}: missing question or session IDs")
-            continue
-        with tempfile.TemporaryDirectory(prefix="mn-bench-lme-") as temporary:
-            vault = Path(temporary) / "vault.db"
-            writes_ok = True
-            for index, session_id in enumerate(session_ids):
-                turns = sessions[index] if index < len(sessions) else []
-                text = " ".join(
-                    str(turn.get("content") or "")
-                    for turn in turns
-                    if isinstance(turn, dict) and turn.get("role") == "user"
-                )
-                if not text.strip():
-                    text = " ".join(str(turn.get("content") or "") for turn in turns if isinstance(turn, dict))
-                entity = f"{session_id}-{_slug(text)}"
-                writes_ok = _vault_remember(bin_path, cli_root, vault, entity, text or session_id) and writes_ok
-            ranked = _recall_question(bin_path, cli_root, vault, str(record.get("question") or ""), 10) if writes_ok else []
-        matched: list[str] = []
-        for name in ranked:
-            session_id = _match_known(name, session_ids)
-            if session_id is not None and session_id not in matched:
-                matched.append(session_id)
-        ranked = matched
-        if not ranked:
-            failures.append(f"{question_id}: no recall observation")
-            continue
-        rows.append(
-            {
-                "question_id": question_id,
-                "question_type": question_type,
-                "answer_session_ids": [str(value) for value in (record.get("answer_session_ids") or [])],
-                "retrieved_session_ids": ranked,
-                "answer": str(record.get("answer") or "")[:300],
-            }
-        )
-    return rows, attempted, failures
+    outcomes = _parallel_map(
+        lambda record: _build_lme_case(record, question_type, bin_path, cli_root),
+        selected,
+        workers,
+    )
+    rows = [row for row, _ in outcomes if row is not None]
+    failures = [reason for _, reason in outcomes if reason is not None]
+    return rows, len(selected), failures
+
+
+def _locomo_seed_one(
+    vault: Path,
+    session_id: str,
+    turn_index: int,
+    turn: Any,
+    bin_path: Path | None,
+    cli_root: Path | None,
+) -> bool:
+    """Seed one utterance as its own entity; independent of all other turns."""
+    if not isinstance(turn, dict):
+        return True
+    text = str(turn.get("text") or "").strip()
+    if not text:
+        return True
+    speaker = str(turn.get("speaker") or "").strip()
+    entity = f"{session_id}-u{turn_index + 1}-{_slug(text)}"
+    fact = f"{speaker}: {text}" if speaker else text
+    return _vault_remember(bin_path, cli_root, vault, entity, fact)
+
+
+def _build_locomo_case(
+    index: int,
+    question: dict[str, Any],
+    vault: Path,
+    session_keys: list[str],
+    writes_ok: bool,
+    bin_path: Path | None,
+    cli_root: Path | None,
+    reader_key: str | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """One causal chain: recall -> top-hit asof -> reader over those facts."""
+    question_id = f"locomo-1-{index + 1}"
+    if not writes_ok:
+        return None, f"{question_id}: vault seed failed"
+    question_text = str(question.get("question") or "")
+    # Query is the question only; gold answer and gold evidence IDs are never
+    # seeded as facts nor injected into the reader prompt.
+    hits = _recall_question(bin_path, cli_root, vault, question_text, 10)
+    ranked: list[str] = []
+    for name in hits:
+        session_id = _match_known(name, session_keys)
+        if session_id is not None and session_id not in ranked:
+            ranked.append(session_id)
+    if not hits or not ranked:
+        return None, f"{question_id}: no recall observation"
+    # The reader sees every CLI-recalled utterance, not just the top hit. These
+    # are observation texts from the public recall surface only; no gold label
+    # or evidence ID is ever added.
+    facts: list[str] = []
+    for name in hits:
+        for item in _vault_asof(bin_path, cli_root, vault, name):
+            text = str(item).strip()
+            if text and text not in facts:
+                facts.append(text)
+    if not facts:
+        return None, f"{question_id}: no recalled content"
+    if not reader_key:
+        return None, f"{question_id}: no reader key configured"
+    answer, error = _reader_answer(question_text, facts, reader_key)
+    if error is not None:
+        return None, f"{question_id}: {error}"
+    if answer.strip().rstrip(".").casefold() == "unsupported":
+        return None, f"{question_id}: reader returned UNSUPPORTED"
+    return (
+        {
+            "question_id": question_id,
+            "gold_answer": str(question.get("answer") or "")[:300],
+            "pred_answer": answer,
+            "answer_source": "reader over CLI-recalled facts",
+            "reader_model": READER_MODEL,
+            "reader_provider": READER_PROVIDER,
+            "recalled_fact_count": len(facts),
+            "pred_entity": hits[0],
+            "retrieved_session_ids": ranked,
+        },
+        None,
+    )
 
 
 def _build_locomo_rows(
@@ -989,6 +1191,8 @@ def _build_locomo_rows(
     dataset: Any,
     bin_path: Path | None,
     cli_root: Path | None,
+    workers: int = MAX_WORKERS,
+    reader_key: str | None = None,
 ) -> tuple[list[dict[str, Any]], int, list[str]]:
     conversations = [item for item in dataset if isinstance(item, dict)] if isinstance(dataset, list) else []
     if not conversations:
@@ -1004,51 +1208,31 @@ def _build_locomo_rows(
     wanted = int(selection.get("effective_denominator") or 0)
     selected = questions[:wanted]
 
-    rows: list[dict[str, Any]] = []
-    failures: list[str] = []
-    attempted = 0
     with tempfile.TemporaryDirectory(prefix="mn-bench-locomo-") as temporary:
         vault = Path(temporary) / "vault.db"
-        writes_ok = True
-        entity_by_session: dict[str, str] = {}
-        for session_id, turns in sessions.items():
-            text = " ".join(
-                f"{turn.get('speaker') or ''}: {turn.get('text') or ''}"
-                for turn in turns
-                if isinstance(turn, dict)
-            )
-            entity = f"{session_id}-{_slug(text)}"
-            entity_by_session[session_id] = entity
-            writes_ok = _vault_remember(bin_path, cli_root, vault, entity, text or session_id) and writes_ok
-        for index, question in enumerate(selected):
-            attempted += 1
-            question_id = f"locomo-1-{index + 1}"
-            if not writes_ok:
-                failures.append(f"{question_id}: vault seed failed")
-                continue
-            hits = _recall_question(bin_path, cli_root, vault, str(question.get("question") or ""), 5)
-            ranked: list[str] = []
-            for name in hits:
-                session_id = _match_known(name, list(sessions))
-                if session_id is not None and session_id not in ranked:
-                    ranked.append(session_id)
-            if not ranked:
-                failures.append(f"{question_id}: no recall observation")
-                continue
-            facts = _vault_asof(bin_path, cli_root, vault, entity_by_session[ranked[0]])
-            if not facts or not str(facts[-1]).strip():
-                failures.append(f"{question_id}: no recalled content")
-                continue
-            rows.append(
-                {
-                    "question_id": question_id,
-                    "gold_answer": str(question.get("answer") or "")[:300],
-                    "pred_answer": facts[-1][:500],
-                    "answer_source": "vault-recall (no generation model)",
-                    "retrieved_session_ids": ranked,
-                }
-            )
-    return rows, attempted, failures
+        # Every remember is independent (one entity per utterance). This seed
+        # barrier completes before any recall, preserving the causal chain.
+        seed_tasks = [
+            (vault, session_id, turn_index, turn, bin_path, cli_root)
+            for session_id, turns in sessions.items()
+            for turn_index, turn in enumerate(turns)
+        ]
+        seed_results = _parallel_map(
+            lambda task: _locomo_seed_one(*task), seed_tasks, workers
+        )
+        writes_ok = all(seed_results)
+        session_keys = list(sessions)
+        outcomes = _parallel_map(
+            lambda pair: _build_locomo_case(
+                pair[0], pair[1], vault, session_keys,
+                writes_ok, bin_path, cli_root, reader_key,
+            ),
+            list(enumerate(selected)),
+            workers,
+        )
+    rows = [row for row, _ in outcomes if row is not None]
+    failures = [reason for _, reason in outcomes if reason is not None]
+    return rows, len(selected), failures
 
 
 ROW_BUILDERS = {
@@ -1064,7 +1248,7 @@ def _synthetic_rows(lane: str, selection: dict[str, Any]) -> list[dict[str, Any]
         configurations = [item for item in selection.get("configurations", []) if isinstance(item, dict)]
         return [
             {
-                "case_id": f"dry-fc-{index + 1}",
+                "case_id": f"dry-fc-{index + 1}@{int(item.get('context_tokens') or 4096)}",
                 "subset": str(item.get("subset") or "MH").upper(),
                 "context_tokens": int(item.get("context_tokens") or 4096),
                 "update_type": "rewrite",
@@ -1112,6 +1296,9 @@ def model_lane_result(
     """Run one pinned lane through its adapter and the public CLI surface."""
     module = adapter_for(lane)
     dry_run = bool(args.dry_run)
+    workers = max(1, min(int(getattr(args, "workers", MAX_WORKERS) or MAX_WORKERS), MAX_WORKERS))
+    # Read the key by name only. Its value never enters any result or log.
+    reader_key = os.environ.get("KILO_API_KEY") if lane == "locomo-small" else None
     common: dict[str, Any] = {
         "lane": lane,
         "run_id": manifest["run_id"],
@@ -1191,7 +1378,9 @@ def model_lane_result(
                 }
             )
             return result
-        rows, attempted, failures = ROW_BUILDERS[lane](selection, dataset, bin_path, cli_root)
+        rows, attempted, failures = ROW_BUILDERS[lane](
+            selection, dataset, bin_path, cli_root, workers, reader_key
+        )
 
     evaluation = module.evaluate(rows, judge_fn=None)
     # Synthetic rows are observations of the wiring, not of the product.
@@ -1252,6 +1441,9 @@ def model_lane_result(
                 "official_split": False,
             },
             "evaluation": _strip_percent_literals(evaluation),
+            "workers": workers,
+            "reader_model": READER_MODEL if lane == "locomo-small" else None,
+            "reader_provider": READER_PROVIDER if lane == "locomo-small" else None,
             "score_asserted": bool(scored > 0 and not dry_run),
         }
     )
@@ -1269,6 +1461,12 @@ def model_lane_result(
             "observation; no score is asserted."
         )
         result["failure_reasons"] = failures[:20]
+        if lane == "longmemeval-temporal":
+            result["limitation"] += (
+                " Dated 2026-11-24 limitation: a case without a real CLI recall "
+                "hit stays unscored; retrieved_session_ids come only from actual "
+                "recall hits and are never fabricated."
+            )
     return result
 
 
@@ -1292,6 +1490,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     cli_root = configured_root if configured_root.is_dir() else None
 
     run_date = datetime.now(timezone.utc).date().isoformat()
+    # One hard ceiling for every lane; a larger request is clamped, not honoured.
+    args.workers = max(1, min(int(getattr(args, "workers", MAX_WORKERS) or MAX_WORKERS), MAX_WORKERS))
     any_failed = False
     for lane in args.lane:
         estimate = estimated_spend(lane, args.max_cases, inputs["pins"])
@@ -1323,6 +1523,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             parameters={
                 "max_cases": args.max_cases,
                 "confirm_spend": bool(args.confirm_spend),
+                "workers": args.workers,
             },
             estimated_spend=estimate,
             results=[
@@ -1652,6 +1853,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--lane", action="append", choices=ALL_RUN_LANES, required=True, help="lane name (repeatable)")
     run.add_argument("--confirm-spend", action="store_true", help="confirm BYOK model/judge spend")
     run.add_argument("--max-cases", type=int, default=None, help="cap cases attempted")
+    run.add_argument(
+        "--workers",
+        type=int,
+        default=MAX_WORKERS,
+        help=f"parallel CLI calls across independent cases/facts (default {MAX_WORKERS}, max {MAX_WORKERS})",
+    )
     run.add_argument("--bin", default=None, help="path to mn (default: MN_BIN then discovery)")
     run.add_argument(
         "--dry-run",
