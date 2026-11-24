@@ -31,6 +31,15 @@ if str(ROOT) not in sys.path:
 from adapters import judge as judge_adapter  # noqa: E402
 from adapters import mcp_stdio, mn_json  # noqa: E402
 
+# LoCoMo modules built by the research phase. Imports are optional so the CLI
+# smoke lanes still work if a module is temporarily absent.
+try:  # noqa: E402
+    import locomo_reader as _locomo_reader
+    import locomo_seed as _locomo_seed
+except ImportError:  # pragma: no cover - optional during partial builds
+    _locomo_reader = None  # type: ignore[assignment]
+    _locomo_seed = None  # type: ignore[assignment]
+
 VERSION = "0.1.0"
 NOTE = "INFORMATIONAL ONLY — NOT AN OFFICIAL SCORE"
 SCHEMA_SMOKE = "memnoth-bench-smoke/1"
@@ -62,10 +71,18 @@ MAX_WORKERS = 8
 # Pinned reader for the LoCoMo lane. Kilo's OpenAI-compatible gateway serves a
 # free, non-reasoning model that returns a short final answer. The key is read
 # from the environment and never logged; no answer is fabricated if it fails.
+# Frozen harness (research 2026-11-24): a strong free reader and a DIFFERENT
+# provider as strict judge. Never vary these to inflate a score; the judge and
+# prompt move LoCoMo by more than the memory system does.
 READER_PROVIDER = "kilo"
-READER_MODEL = "baidu/ernie-5.5-flash-preview:free"
+READER_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
+JUDGE_MODEL = "baidu/ernie-5.5-flash-preview:free"
 READER_BASE_URL = "https://ai-gateway.kilo.ai/api/v1"
-READER_SYSTEM_PROMPT = "Answer with only the exact value from the provided facts; if absent, say UNSUPPORTED."
+# Use the module's frozen 7-step prompt verbatim -- a shorter prompt makes this
+# reasoning model emit empty content (verified 2026-11-24). Never substitute.
+READER_SYSTEM_PROMPT = (
+    _locomo_reader.READER_PROMPT_7STEP if _locomo_reader is not None else ""
+)
 
 _PERCENT = re.compile(r"(?<![\w])(\d+(?:\.\d+)?)\s*%")
 
@@ -1107,26 +1124,6 @@ def _build_lme_rows(
     return rows, len(selected), failures
 
 
-def _locomo_seed_one(
-    vault: Path,
-    session_id: str,
-    turn_index: int,
-    turn: Any,
-    bin_path: Path | None,
-    cli_root: Path | None,
-) -> bool:
-    """Seed one utterance as its own entity; independent of all other turns."""
-    if not isinstance(turn, dict):
-        return True
-    text = str(turn.get("text") or "").strip()
-    if not text:
-        return True
-    speaker = str(turn.get("speaker") or "").strip()
-    entity = f"{session_id}-u{turn_index + 1}-{_slug(text)}"
-    fact = f"{speaker}: {text}" if speaker else text
-    return _vault_remember(bin_path, cli_root, vault, entity, fact)
-
-
 def _build_locomo_case(
     index: int,
     question: dict[str, Any],
@@ -1137,14 +1134,20 @@ def _build_locomo_case(
     cli_root: Path | None,
     reader_key: str | None,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    """One causal chain: recall -> top-hit asof -> reader over those facts."""
+    """One causal chain: hybrid recall -> asof -> frozen reader over facts."""
     question_id = f"locomo-1-{index + 1}"
     if not writes_ok:
         return None, f"{question_id}: vault seed failed"
     question_text = str(question.get("question") or "")
-    # Query is the question only; gold answer and gold evidence IDs are never
-    # seeded as facts nor injected into the reader prompt.
-    hits = _recall_question(bin_path, cli_root, vault, question_text, 10)
+    # Gold answer and gold evidence IDs are NEVER seeded or shown to the reader.
+    if _locomo_seed is not None:
+        hits = _locomo_seed.recall_question(
+            lambda q, n: _recall_question(bin_path, cli_root, vault, q, n),
+            question_text,
+            10,
+        )
+    else:  # pragma: no cover - fallback if module absent
+        hits = _recall_question(bin_path, cli_root, vault, question_text, 10)
     ranked: list[str] = []
     for name in hits:
         session_id = _match_known(name, session_keys)
@@ -1152,9 +1155,6 @@ def _build_locomo_case(
             ranked.append(session_id)
     if not hits or not ranked:
         return None, f"{question_id}: no recall observation"
-    # The reader sees every CLI-recalled utterance, not just the top hit. These
-    # are observation texts from the public recall surface only; no gold label
-    # or evidence ID is ever added.
     facts: list[str] = []
     for name in hits:
         for item in _vault_asof(bin_path, cli_root, vault, name):
@@ -1165,19 +1165,29 @@ def _build_locomo_case(
         return None, f"{question_id}: no recalled content"
     if not reader_key:
         return None, f"{question_id}: no reader key configured"
-    answer, error = _reader_answer(question_text, facts, reader_key)
+    if _locomo_reader is not None:
+        answer, error = _locomo_reader.reader_answer(
+            question_text, facts, reader_key,
+            reader_model=READER_MODEL, base_url=READER_BASE_URL,
+            system_prompt=READER_SYSTEM_PROMPT,
+        )
+        unsupported = _locomo_reader.is_unsupported(answer)
+    else:  # pragma: no cover
+        answer, error = _reader_answer(question_text, facts, reader_key)
+        unsupported = bool(answer) and answer.strip().rstrip(".").casefold() == "unsupported"
     if error is not None:
         return None, f"{question_id}: {error}"
-    if answer.strip().rstrip(".").casefold() == "unsupported":
+    if unsupported:
         return None, f"{question_id}: reader returned UNSUPPORTED"
     return (
         {
             "question_id": question_id,
             "gold_answer": str(question.get("answer") or "")[:300],
             "pred_answer": answer,
-            "answer_source": "reader over CLI-recalled facts",
+            "answer_source": "reader over CLI-recalled facts (frozen harness)",
             "reader_model": READER_MODEL,
             "reader_provider": READER_PROVIDER,
+            "judge_model": JUDGE_MODEL,
             "recalled_fact_count": len(facts),
             "pred_entity": hits[0],
             "retrieved_session_ids": ranked,
@@ -1199,10 +1209,13 @@ def _build_locomo_rows(
         return [], 0, ["no pinned conversation"]
     record = conversations[0]
     conversation = record.get("conversation") if isinstance(record.get("conversation"), dict) else record
-    sessions: dict[str, list[Any]] = {
+    # Pass the FULL conversation so seed_conversation can discover the real
+    # session_N_date_time metadata keys; filtering them out left every utterance
+    # undated and made relative references (yesterday) unresolvable.
+    sessions: dict[str, Any] = {
         key: value
         for key, value in conversation.items()
-        if key.startswith("session_") and isinstance(value, list)
+        if key.startswith("session_")
     }
     questions = [item for item in (record.get("qa") or []) if isinstance(item, dict)]
     wanted = int(selection.get("effective_denominator") or 0)
@@ -1210,18 +1223,21 @@ def _build_locomo_rows(
 
     with tempfile.TemporaryDirectory(prefix="mn-bench-locomo-") as temporary:
         vault = Path(temporary) / "vault.db"
-        # Every remember is independent (one entity per utterance). This seed
-        # barrier completes before any recall, preserving the causal chain.
-        seed_tasks = [
-            (vault, session_id, turn_index, turn, bin_path, cli_root)
-            for session_id, turns in sessions.items()
-            for turn_index, turn in enumerate(turns)
+        seed_detail: dict[str, Any] = {}
+        # Atomic per-turn facts with REAL absolute-date metadata; no fabrication.
+        def _remember(entity: str, text: str) -> bool:
+            return _vault_remember(bin_path, cli_root, vault, entity, text)
+        if _locomo_seed is not None:
+            writes_ok = _locomo_seed.seed_conversation(
+                _remember, sessions, workers, detail=seed_detail
+            )
+        else:  # pragma: no cover - module required for the research harness
+            return [], 0, ["locomo_seed module unavailable; refusing legacy seed"]
+        session_keys = [
+            k for k in sessions
+            if k.startswith("session_") and isinstance(sessions[k], list)
+            and not k.endswith("_date_time")
         ]
-        seed_results = _parallel_map(
-            lambda task: _locomo_seed_one(*task), seed_tasks, workers
-        )
-        writes_ok = all(seed_results)
-        session_keys = list(sessions)
         outcomes = _parallel_map(
             lambda pair: _build_locomo_case(
                 pair[0], pair[1], vault, session_keys,
