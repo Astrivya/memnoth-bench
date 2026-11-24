@@ -487,8 +487,9 @@ def reader_call(
 
     Pass a key obtained from ``KeyPool.get()``; this function stores none. The
     prompt contains only the question and question-relevant conversation-fact
-    excerpts -- no ideal answer, rubric, or annotation. The bare-UNSUPPORTED
-    abstention rule in the system prompt is unchanged.
+    excerpts -- no ideal answer, rubric, or annotation. The prompt now asks for
+    a complete answer that reproduces the facts exactly; the bare-UNSUPPORTED
+    abstention sentinel and its pre-judge guard (``is_abstention``) are unchanged.
     """
     call = opener or urllib.request.urlopen
     payload = {
@@ -497,18 +498,23 @@ def reader_call(
             {
                 "role": "system",
                 "content": (
-                    "Answer using ONLY the provided conversation facts. Resolve relative "
-                    "references (yesterday, last week) using the absolute dates in the "
-                    "facts. Read the evidence oldest-first. Be concise and preserve "
-                    "absolute dates in the answer. If the answer is not supported by "
-                    "the facts, say UNSUPPORTED."
+                    "Answer using ONLY the provided conversation facts. Each fact is "
+                    "a verbatim excerpt from the conversation, labelled with its "
+                    "speaker and absolute date, in chronological order (oldest first). "
+                    "Use those absolute dates to resolve relative references "
+                    "(yesterday, last week). Give a complete, self-contained answer "
+                    "that addresses every part of the question; reproduce exact "
+                    "names, values, dates and numbers from the facts instead of "
+                    "paraphrasing them. If the conversation contains no information "
+                    "about the question, say plainly that it contains no information "
+                    "about it. Never invent an answer the facts do not support."
                 ),
             },
             {
                 "role": "user",
                 "content": (
                     f"Question: {str(question)[:4000]}\n"
-                    f"Facts (question-relevant excerpts from the conversation):\n"
+                    f"Verbatim conversation excerpts (speaker + absolute date, chronological oldest-first):\n"
                     f"{_select_evidence(question, context)}"
                 ),
             },
