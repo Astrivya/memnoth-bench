@@ -33,6 +33,22 @@ python runner/bench.py smoke
 MEMNOTH_BENCH=1 python runner/bench.py run --lane memoryagentbench-mh --confirm-spend
 ```
 
+## Running locally
+
+The smoke lane shells out to the public `mn` binary (`MN_BIN`, else PATH, else
+the sibling CLI checkout). Two knobs cover a local setup:
+
+- `MEMNOTH_MCP_BIN` — path to an installed `memnoth-mcp` binary for the
+  `mcp-stdio` lane. Without it (and with no binary in the CLI checkout's
+  `target/debug` / `target/release`) that lane records a structured `blocked`
+  result instead of a score.
+- `MN_CLI_ROOT` — set this when the CLI checkout is **not** a sibling `CLI/`
+  directory; it points the runner at the CLI root holding the `ci/` fixtures.
+
+Keys are read from env by name (or injected as CI secrets) only — never written
+into tracked files. Policy, docs map, and definition of done live in the
+workspace root `docs/`; this README defers to them.
+
 ## Rules
 
 1. Keys are read from env by name. Only `.env.example` is tracked. Never print a value.

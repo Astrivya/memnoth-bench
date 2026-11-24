@@ -4,13 +4,45 @@
 
 ## Source and pins
 
-- Source: `https://github.com/microsoft/LoCoMo`
-- Upstream commit: `PIN_BEFORE_USE` — fill with the exact commit the conversation artifact came from.
-- Dataset URL: `PIN_BEFORE_USE` in `adapter.py` (`DATASET_URL`).
-- Dataset SHA-256: `PIN_BEFORE_USE` in `adapter.py` (`DATASET_SHA256`). Compute it from the exact downloaded artifact; **never invent a hash**.
+- Official source (dataset and code): `https://github.com/snap-research/locomo`
+- Upstream commit (pinned): `3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376`, obtained from
+  `gh api repos/snap-research/locomo/commits/main --jq .sha`.
+- Upstream artifact path: `data/locomo10.json` (the official 10-conversation release;
+  the download was checked to contain 10 samples).
+- Pinned artifact URL (`DATASET_URL` in `adapter.py`):
+  `https://raw.githubusercontent.com/snap-research/locomo/3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376/data/locomo10.json`
+- Artifact SHA-256 (`DATASET_SHA256` in `adapter.py`):
+  `79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4`
+  Computed from one real download of the exact pinned URL to
+  `D:/temp/opencode/locomo10.json` (outside the repository) with
+  `Get-FileHash -Algorithm SHA256 D:/temp/opencode/locomo10.json`. The artifact is
+  **not** vendored.
+- Local path after verification: `data/locomo/locomo_conversation.json` (gitignored).
 - Judge pin (optional lane): `gpt-4o-2024-08-06`, temperature `0` (`JUDGE`). Records the pin only; `enforced_by_adapter: false`.
 
-`prepare()` refuses to download until the `PIN_BEFORE_USE` values are replaced. Downloads land only in gitignored `data/`, are hashed in a temp file, and are moved into place only after SHA-256 verification. Dataset bytes are never vendored.
+`prepare()` uses only the verified pins above. Downloads land only in gitignored
+`data/`, are hashed in a temp file, and are moved into place only after SHA-256
+verification. Dataset bytes are never committed.
+
+## Upstream evaluation commands and published metric
+
+Confirmed from the upstream `README.MD` and scripts at the pinned commit:
+
+- `bash scripts/generate_observations.sh` regenerates RAG observations;
+  `bash scripts/generate_session_summaries.sh` regenerates session summaries.
+- QA evaluation entry points are `bash scripts/evaluate_gpts.sh`,
+  `bash scripts/evaluate_claude.sh`, `bash scripts/evaluate_gemini.sh`,
+  `bash scripts/evaluate_hf_llm.sh` and `bash scripts/evaluate_rag_gpts.sh`;
+  they call `python3 task_eval/evaluate_qa.py`.
+- The published QA metric is **token-level F1** (SQuAD-style with normalization and
+  Porter stemming: `f1_score` / `f1` in `task_eval/evaluation.py`), reported per
+  category and overall by `task_eval/evaluation_stats.py` (the `*_f1` keys). Upstream
+  also computes exact match, BERTScore, ROUGE-L and evidence recall. Its evaluation
+  scripts do **not** use an LLM judge.
+
+This lane's F1 is deterministic and judge-free, but it is not the upstream scorer,
+and this one-conversation / five-question slice is not the upstream ten-conversation
+evaluation. The numbers are not comparable to published LoCoMo results.
 
 ## Slice
 
@@ -35,11 +67,17 @@ python -m harnesses.locomo.adapter --smoke
 
 ## License note
 
-The LoCoMo dataset and code are **research-only, third-party material**. Memnoth's Apache-2.0 license does **not** grant redistribution rights to upstream data. Never commit dataset bytes or upstream checkouts; commit only pins, IDs, and derived diagnostics. Verify the upstream license before any internal use and honor its terms.
+The LoCoMo dataset and code are **third-party, research-only material**. The
+upstream `LICENSE.txt` at the pinned commit is **Creative Commons Attribution-
+NonCommercial 4.0 International (CC BY-NC 4.0)** — non-commercial use, with
+attribution to the LoCoMo authors and their ACL 2024 paper required. Memnoth's
+Apache-2.0 license does **not** grant redistribution rights to upstream data.
+Never commit dataset bytes or upstream checkouts; commit only pins, IDs, and
+derived diagnostics. Honor the upstream license terms before any internal use.
 
 ## What the metric does NOT prove
 
-- Not an official LoCoMo result; five questions and one conversation are a local diagnostic.
+- Not an official LoCoMo result; five questions and one conversation are a local diagnostic, and this adapter is not the upstream scorer.
 - Token F1 rewards lexical overlap, not semantic correctness or factual accuracy.
 - A single conversation cannot characterize long-horizon memory across many users or sessions.
 - Token counts and latency are not a speed or efficiency claim and are not comparable across hardware/providers.

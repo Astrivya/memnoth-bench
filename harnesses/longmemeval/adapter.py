@@ -20,7 +20,6 @@ from typing import Any, Callable
 
 try:  # normal package import
     from ..common import (
-        PIN_BEFORE_USE,
         apply_judge,
         denominator,
         fetch_pinned,
@@ -37,7 +36,6 @@ except (ImportError, ValueError):  # loaded directly by path
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from common import (
-        PIN_BEFORE_USE,
         apply_judge,
         denominator,
         fetch_pinned,
@@ -55,17 +53,42 @@ SOURCE_URL = "https://github.com/xiaowu0162/LongMemEval"
 PAPER_URL = "https://arxiv.org/abs/2410.10813"
 
 # --------------------------------------------------------------------------- #
-# PINS -- replace every PIN_BEFORE_USE with a verified value before use.
+# PINS -- verified 2026-11-24 against the official upstream sources.
 # Never guess a hash: compute it from the exact artifact you downloaded.
 # --------------------------------------------------------------------------- #
-DATASET_URL = PIN_BEFORE_USE  # PIN_BEFORE_USE: pinned oracle-split artifact URL
-DATASET_SHA256 = PIN_BEFORE_USE  # PIN_BEFORE_USE: SHA-256 of that exact artifact
-UPSTREAM_COMMIT = PIN_BEFORE_USE  # PIN_BEFORE_USE: upstream git commit the artifact came from
+# The official cleaned dataset is hosted on HuggingFace. `longmemeval_oracle.json`
+# is the only released variant carrying the `answer_session_ids` labels this
+# adapter reads; the `_s` and `_m` variants are not used here. The URL pins the
+# exact HF dataset commit that serves the artifact, so content cannot drift
+# with `main`. Provenance:
+#   HF commits API:
+#     https://huggingface.co/api/datasets/xiaowu0162/longmemeval-cleaned/commits/main
+#   HF tree at the pinned commit (same `lfs.oid` as the SHA-256 below):
+#     https://huggingface.co/api/datasets/xiaowu0162/longmemeval-cleaned/tree/98d7416c24c778c2fee6e6f3006e7a073259d48f
+DATASET_URL = (
+    "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/"
+    "98d7416c24c778c2fee6e6f3006e7a073259d48f/longmemeval_oracle.json"
+)
+# SHA-256 of that exact file (15,388,478 bytes). Verified two independent ways:
+#   (a) the HF tree API reports this value as `lfs.oid` for the file at the
+#       pinned commit (Git LFS oid is the SHA-256 of the file contents);
+#   (b) `Get-FileHash -Algorithm SHA256` on the single downloaded artifact.
+# Both produced the digest below. No hash was invented.
+DATASET_SHA256 = "821a2034d219ab45846873dd14c14f12cfe7776e73527a483f9dac095d38620c"
+# Upstream GitHub repository HEAD at pin time (the source linked by SOURCE_URL),
+# from `gh api repos/xiaowu0162/LongMemEval/commits/main --jq .sha`. This is a
+# resolved commit, not a branch name, and is distinct from the HF dataset
+# commit embedded in DATASET_URL above.
+UPSTREAM_COMMIT = "9e0b455f4ef0e2ab8f2e582289761153549043fc"
 
 VARIANT = "oracle"
 QUESTION_TYPE_FILTER = "temporal-reasoning"
 KS: tuple[int, ...] = (1, 3, 5, 10)
 
+# Judge pin verified against the pinned upstream `src/evaluation/evaluate_qa.py`:
+# `model_zoo['gpt-4o']` resolves to `gpt-4o-2024-08-06` and the completion kwargs
+# set `temperature=0`. Upstream's README invokes `evaluate_qa.py gpt-4o ...`;
+# `gpt-4o` is the alias that resolves to the pinned snapshot below.
 JUDGE: dict[str, Any] = {
     "model": "gpt-4o-2024-08-06",
     "temperature": 0,
@@ -89,8 +112,9 @@ _NOTE = (
 def prepare(local_dir: str | Path = "data/longmemeval") -> Path:
     """Download and SHA-256-verify the pinned oracle dataset into ``data/``.
 
-    Currently refuses to run because the pins are placeholders. This is a
-    network boundary and is never invoked at import time or by ``--smoke``.
+    The URL and SHA-256 pins above are real; ``fetch_pinned`` still refuses
+    placeholders or a byte mismatch. This is a network boundary and is never
+    invoked at import time or by ``--smoke``.
     """
     dest = Path(local_dir) / "longmemeval_oracle.json"
     return fetch_pinned(DATASET_URL, DATASET_SHA256, dest)
@@ -347,5 +371,5 @@ if __name__ == "__main__":
     parser.add_argument("--smoke", action="store_true", help="offline synthetic smoke test")
     args = parser.parse_args()
     if not args.smoke:
-        parser.error("pass --smoke; dataset preparation requires real PIN_BEFORE_USE values")
+        parser.error("pass --smoke; dataset preparation is a verified network boundary")
     print(json.dumps(self_test(), indent=2, sort_keys=True))

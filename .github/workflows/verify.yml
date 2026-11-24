@@ -234,3 +234,52 @@ jobs:
               sys.exit(f"Summary invariants failed with {len(failures)} violation(s)")
           print(f"Summary invariants OK: {len(entries)} entr(y/ies) checked.")
           PY
+
+      # 5. targets/cli.lock hygiene: `commit` must be a full 40-hex SHA. When
+      #    the public CLI repo is reachable, it must also match that repo's
+      #    public HEAD. Any network failure (offline, DNS, rate limit, timeout)
+      #    is a RECORDED LIMITATION, never a job failure: this read-only
+      #    verification must never depend on network availability.
+      - name: '5. targets/cli.lock commit is a 40-hex SHA + public HEAD (online only)'
+        run: |
+          python - <<'PY'
+          import json, pathlib, re, subprocess, sys
+
+          lock_path = pathlib.Path("targets/cli.lock")
+          try:
+              data = json.loads(lock_path.read_text(encoding="utf-8"))
+          except (OSError, json.JSONDecodeError) as exc:
+              sys.exit(f"FAIL: cannot read targets/cli.lock: {exc}")
+
+          commit = data.get("commit")
+          if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", commit):
+              sys.exit(f"FAIL: cli.lock commit is not a 40-hex SHA: {commit!r}")
+          print(f"cli.lock commit format OK: {commit}")
+
+          repo = data.get("repository") or "https://github.com/Astrivya/memnoth"
+          try:
+              result = subprocess.run(
+                  ["git", "ls-remote", repo, "HEAD"],
+                  capture_output=True, text=True, timeout=25, check=True,
+              )
+              out = result.stdout.strip()
+          except (OSError, subprocess.SubprocessError) as exc:
+              print("::notice title=cli.lock HEAD check skipped (offline)::"
+                    f"network unavailable ({type(exc).__name__}); format validated only. "
+                    "LIMITATION: public HEAD not compared.")
+              sys.exit(0)
+
+          head = out.split()[0] if out else ""
+          if not re.fullmatch(r"[0-9a-fA-F]{40}", head):
+              print("::notice title=cli.lock HEAD check skipped (offline)::"
+                    "unexpected git ls-remote response; format validated only. "
+                    "LIMITATION: public HEAD not compared.")
+              sys.exit(0)
+
+          if commit.lower() != head.lower():
+              sys.exit(
+                  f"FAIL: cli.lock commit {commit} != public CLI HEAD {head}. "
+                  "Re-validate targets/cli.lock before merging."
+              )
+          print(f"cli.lock commit matches public HEAD: {head}")
+          PY

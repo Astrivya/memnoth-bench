@@ -65,10 +65,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      # Flip to 'true' only after replacing PIN_BEFORE_USE in the install step.
-      INSTALL_PINNED_CLI: 'false'
+      # Kept in lockstep with targets/cli.lock; bump both when the lock moves.
+      CLI_REF: df52a083adeecb52503d14253962157e8e632a72
+      CLI_REPO: https://github.com/Astrivya/memnoth
     steps:
-      - name: Checkout
+      - name: Checkout bench repo
         uses: actions/checkout@v4
 
       - name: Set up Python 3.11
@@ -76,27 +77,34 @@ jobs:
         with:
           python-version: '3.11'
 
-      # The runner calls the PUBLIC mn binary and expects MN_BIN to point at it,
-      # or a compatible mn to be on PATH. A public CLI must therefore be
-      # installed/provided by the runner. Two supported options:
-      #   1. (current) leave MN_BIN unset and ensure a public `mn` is on PATH;
-      #      the runner fails loudly if neither is available — no fake score.
-      #   2. enable the pinned public-release download below after replacing
-      #      PIN_BEFORE_USE with a real public release tag AND its SHA-256 from
-      #      https://github.com/Astrivya/memnoth/releases (see targets/cli.lock).
-      - name: Install pinned public mn CLI (OPTIONAL — disabled until pinned)
-        if: ${{ env.INSTALL_PINNED_CLI == 'true' }}
-        env:
-          # PIN_BEFORE_USE: real public tag + SHA-256 from the public repo releases.
-          MN_VERSION: 'PIN_BEFORE_USE'
-          MN_SHA256: 'PIN_BEFORE_USE'
+      # The smoke runner shells out to the PUBLIC `mn` binary and expects MN_BIN
+      # to point at it (falling back to `mn` on PATH). We use approach (a): build
+      # the public CLI from source at the exact commit pinned in targets/cli.lock.
+      # Preferred over downloading a release asset (b) because it is reproducible
+      # from the public Astrivya/memnoth repo and needs no published tag/SHA-256
+      # (this commit may have no matching release asset). CARGO_TARGET_DIR stays
+      # under runner.temp so the build never writes into the checkout, and is
+      # cached by pinned commit so a cold compile does not inflate CI time.
+      - name: Cache pinned CLI build (keyed by commit)
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/memnoth-target
+          key: ${{ runner.os }}-memnoth-cli-${{ env.CLI_REF }}-v1
+          restore-keys: ${{ runner.os }}-memnoth-cli-
+
+      - name: Build pinned public mn CLI from source
         run: |
           set -euo pipefail
-          url="https://github.com/Astrivya/memnoth/releases/download/${MN_VERSION}/mn-linux-x86_64.tar.gz"
-          curl -fsSL "$url" -o /tmp/mn.tar.gz
-          echo "${MN_SHA256}  /tmp/mn.tar.gz" | sha256sum -c -
-          tar -xzf /tmp/mn.tar.gz -C "$HOME/.local/bin" mn
-          echo "MN_BIN=$HOME/.local/bin/mn" >> "$GITHUB_ENV"
+          cli_dir="${RUNNER_TEMP}/memnoth-cli-src"
+          rm -rf "$cli_dir"
+          git init "$cli_dir"
+          git -C "$cli_dir" remote add origin "$CLI_REPO"
+          git -C "$cli_dir" fetch --depth 1 origin "$CLI_REF"
+          git -C "$cli_dir" checkout --detach FETCH_HEAD
+          cd "$cli_dir"
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/memnoth-target"
+          cargo build --locked --bin mn
+          echo "MN_BIN=${CARGO_TARGET_DIR}/debug/mn" >> "$GITHUB_ENV"
 
       # Model-free. Reads no provider keys and makes no spend. Still fails
       # visibly if the CLI surface is missing — never masked with `|| true`.

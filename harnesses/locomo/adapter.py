@@ -16,7 +16,6 @@ from typing import Any, Callable
 
 try:  # normal package import
     from ..common import (
-        PIN_BEFORE_USE,
         apply_judge,
         denominator,
         fetch_pinned,
@@ -35,7 +34,6 @@ except (ImportError, ValueError):  # loaded directly by path
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from common import (
-        PIN_BEFORE_USE,
         apply_judge,
         denominator,
         fetch_pinned,
@@ -51,16 +49,18 @@ except (ImportError, ValueError):  # loaded directly by path
     )
 
 LANE = "locomo"
-SOURCE_URL = "https://github.com/microsoft/LoCoMo"
+SOURCE_URL = "https://github.com/snap-research/locomo"
 CONVERSATIONS = 1
 QUESTIONS = 5
 
 # --------------------------------------------------------------------------- #
-# PINS -- replace every PIN_BEFORE_USE with a verified value before use.
+# PINS -- verified against the official snap-research/locomo repository.
+# Provenance: gh api repos/snap-research/locomo/commits/main --jq .sha
+# Hash: Get-FileHash -Algorithm SHA256 on a single download of that pinned URL.
 # --------------------------------------------------------------------------- #
-DATASET_URL = PIN_BEFORE_USE  # PIN_BEFORE_USE: pinned LoCoMo conversation artifact URL
-DATASET_SHA256 = PIN_BEFORE_USE  # PIN_BEFORE_USE: SHA-256 of that exact artifact
-UPSTREAM_COMMIT = PIN_BEFORE_USE  # PIN_BEFORE_USE: upstream git commit the artifact came from
+UPSTREAM_COMMIT = "3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376"
+DATASET_URL = "https://raw.githubusercontent.com/snap-research/locomo/3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376/data/locomo10.json"
+DATASET_SHA256 = "79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4"
 
 JUDGE: dict[str, Any] = {
     "model": "gpt-4o-2024-08-06",
@@ -81,8 +81,8 @@ _NOTE = (
 def prepare(local_dir: str | Path = "data/locomo") -> Path:
     """Download and SHA-256-verify the pinned conversation into ``data/``.
 
-    Refuses to run while the pins are placeholders. Never called at import
-    time or by ``--smoke``.
+    Uses only the verified pins above and refuses unverified pins. Never
+    called at import time or by ``--smoke``.
     """
     dest = Path(local_dir) / "locomo_conversation.json"
     return fetch_pinned(DATASET_URL, DATASET_SHA256, dest)
@@ -284,5 +284,5 @@ if __name__ == "__main__":
     parser.add_argument("--smoke", action="store_true", help="offline synthetic smoke test")
     args = parser.parse_args()
     if not args.smoke:
-        parser.error("pass --smoke; dataset preparation requires real PIN_BEFORE_USE values")
+        parser.error("pass --smoke; dataset preparation is a separate network-enabled step")
     print(json.dumps(self_test(), indent=2, sort_keys=True))

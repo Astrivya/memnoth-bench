@@ -4,6 +4,19 @@ The child is spawned with a read-only profile, a throwaway vault path, and an
 environment allowlist that contains no provider or cloud keys. Replies are
 matched by request id; out-of-order replies are kept rather than discarded.
 No environment value is printed anywhere in this module.
+
+Binary resolution (honest boundary): this module does NOT read an environment
+variable or search the filesystem itself — ``Client`` receives an explicit
+``binary`` path from its caller. The bench runner resolves that path as follows:
+
+* ``MEMNOTH_MCP_BIN`` (exact env var name) wins when set;
+* otherwise it auto-discovers ``memnoth-mcp`` / ``memnoth-mcp.exe`` in the CLI
+  checkout's ``target/debug`` and ``target/release`` dirs (the sibling ``CLI/``
+  checkout is the default; override the root with ``MN_CLI_ROOT``);
+* with neither available, the runner records a structured ``blocked`` result
+  for the mcp-stdio lane rather than fabricating a binary or a score.
+
+No absolute machine path is baked into this module or the runner's discovery.
 """
 
 from __future__ import annotations

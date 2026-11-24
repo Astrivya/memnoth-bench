@@ -1,8 +1,8 @@
 {
   "repository": "https://github.com/Astrivya/memnoth",
-  "commit": "df52a08",
+  "commit": "df52a083adeecb52503d14253962157e8e632a72",
   "version": "0.1.2",
-  "validated_at": "2026-11-23",
+  "validated_at": "2026-11-24",
   "public_surface": {
     "cli_json": "mn <verb> --json -> {ok, command, version, data, schema?}",
     "mcp_stdio": "newline-delimited JSON-RPC; methods server/discover, initialize, tools/list, tools/call"

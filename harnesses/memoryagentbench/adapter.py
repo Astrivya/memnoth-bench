@@ -26,7 +26,6 @@ from typing import Any, Callable
 
 try:  # normal package import
     from ..common import (
-        PIN_BEFORE_USE,
         apply_judge,
         denominator,
         fetch_pinned,
@@ -43,7 +42,6 @@ except (ImportError, ValueError):  # loaded directly by path
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from common import (
-        PIN_BEFORE_USE,
         apply_judge,
         denominator,
         fetch_pinned,
@@ -57,21 +55,36 @@ except (ImportError, ValueError):  # loaded directly by path
     )
 
 LANE = "memoryagentbench"
-SOURCE_URL = "https://github.com/Yukun-Cui/MemoryAgentBench"
-MQUAKE_URL = "https://github.com/stanfordnlp/MQUAKE"
+SOURCE_URL = "https://github.com/HUST-AI-HYZ/MemoryAgentBench"
+MQUAKE_URL = "https://github.com/princeton-nlp/MQuAKE"
 TASK = "FactConsolidation"
 SUBSETS: tuple[str, ...] = ("SH", "MH")
 CONTEXT_TOKENS: tuple[int, ...] = (4096, 8192)
 VALID_UPDATE_TYPES: tuple[str, ...] = ("true", "rewrite")
 
 # --------------------------------------------------------------------------- #
-# PINS -- replace every PIN_BEFORE_USE with a verified value before use.
-# Never invent a hash: compute it from the exact artifact you downloaded.
+# PINS -- verified 2026-11-24. Every value below is traceable to a public URL.
+# Never invent a hash: DATASET_SHA256 was computed from the exact bytes at
+# DATASET_URL (1,491,588 bytes) and matches the HF Git-LFS OID for that file.
 # --------------------------------------------------------------------------- #
-DATASET_URL = PIN_BEFORE_USE  # PIN_BEFORE_USE: pinned FactConsolidation artifact URL
-DATASET_SHA256 = PIN_BEFORE_USE  # PIN_BEFORE_USE: SHA-256 of that exact artifact
-UPSTREAM_COMMIT = PIN_BEFORE_USE  # PIN_BEFORE_USE: upstream git commit for the harness
-MQUAKE_COMMIT = PIN_BEFORE_USE  # PIN_BEFORE_USE: upstream git commit for MQUAKE pairs
+# HF dataset ai-hyz/MemoryAgentBench, revision (immutable commit) 7ea06698...
+# split "Conflict_Resolution" (FactConsolidation-SH + FactConsolidation-MH).
+# The revision is embedded in the resolve URL, not just the branch name.
+DATASET_URL = (
+    "https://huggingface.co/datasets/ai-hyz/MemoryAgentBench/resolve/"
+    "7ea066982b140a19337e17e60d45d4076e042faf/"
+    "data/Conflict_Resolution-00000-of-00001.parquet?download=true"
+)
+DATASET_SHA256 = "24d5c3f09ce0ce15625cb9f8a98f44f0d864ca6c94d7b4ad04eb697ca3a5ff45"
+# Official ICLR 2026 code repo, refs/heads/main as verified on 2026-11-24:
+# https://github.com/HUST-AI-HYZ/MemoryAgentBench/commit/53802608...
+# ("Merge pull request #25 from vbcherepanov/feat/total-agent-memory-method")
+UPSTREAM_COMMIT = "538026089d1a8a8eff05121d0db89b388f360eba"
+# MQUAKE (Zhong et al., 2023b, EMNLP 2023) source of the true+rewrite pairs,
+# refs/heads/main as verified on 2026-11-24. The paper cites MQUAKE as the
+# source of the counterfactual edit pairs used to build FactConsolidation:
+# https://github.com/princeton-nlp/MQuAKE/commit/fb43dadc... ("update mquake-cf-3k-v2 (#12)")
+MQUAKE_COMMIT = "fb43dadc2d8cd19d08ce81c63d957b59deb3f3cd"
 
 JUDGE: dict[str, Any] = {
     "model": "gpt-4o-2024-08-06",
@@ -97,12 +110,13 @@ _NOTE = (
 def prepare(local_dir: str | Path = "data/memoryagentbench") -> Path:
     """Download and SHA-256-verify the pinned FactConsolidation artifact.
 
-    The upstream build combines MQUAKE true + rewrite pairs; the pairs are not
-    fetched separately here so there is a single pinned, checksummed artifact.
-    Refuses to run while pins are placeholders. Never called at import time or
-    by ``--smoke``.
+    The artifact is the ``Conflict_Resolution`` parquet split of the pinned HF
+    dataset revision; it holds both SH and MH FactConsolidation cases built
+    from MQUAKE true + rewrite pairs. The pairs are not fetched separately, so
+    there is one pinned, checksummed file. Refuses to run on placeholder pins.
+    Never called at import time or by ``--smoke``.
     """
-    dest = Path(local_dir) / "fact_consolidation.json"
+    dest = Path(local_dir) / "Conflict_Resolution-00000-of-00001.parquet"
     return fetch_pinned(DATASET_URL, DATASET_SHA256, dest)
 
 
@@ -548,5 +562,5 @@ if __name__ == "__main__":
     parser.add_argument("--smoke", action="store_true", help="offline synthetic smoke test")
     args = parser.parse_args()
     if not args.smoke:
-        parser.error("pass --smoke; dataset preparation requires real PIN_BEFORE_USE values")
+        parser.error("pass --smoke; dataset preparation needs the pinned artifact and network access")
     print(json.dumps(self_test(), indent=2, sort_keys=True))
