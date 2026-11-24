@@ -608,6 +608,37 @@ def _cap(items: list[Any], max_cases: int | None) -> list[Any]:
     return list(items)[:max_cases]
 
 
+def _interleave_contexts(
+    configurations: list[Any], contexts: list[Any] | None = None
+) -> list[Any]:
+    """Round-robin configurations across context buckets before any cap.
+
+    select() emits every ordinal of one context before the next, so slicing the
+    first N configurations leaves every later context with a zero denominator.
+    Preserve each bucket's fixture order, take one per context in fixture order,
+    and stop when a bucket is exhausted. Never pads.
+    """
+    ordered: list[Any] = []
+    for value in contexts or []:
+        if value not in ordered:
+            ordered.append(value)
+    buckets: dict[Any, list[Any]] = {}
+    for item in configurations:
+        key = item.get("context_tokens") if isinstance(item, dict) else None
+        if key not in buckets:
+            buckets[key] = []
+        buckets[key].append(item)
+        if key not in ordered:
+            ordered.append(key)
+    interleaved: list[Any] = []
+    for index in range(max((len(bucket) for bucket in buckets.values()), default=0)):
+        for key in ordered:
+            bucket = buckets.get(key) or []
+            if index < len(bucket):
+                interleaved.append(bucket[index])
+    return interleaved
+
+
 def selection_for_lane(lane: str, module: Any, max_cases: int | None) -> dict[str, Any]:
     """Pin the lane's subset before capping; never let SH stand in for MH."""
     selection = dict(module.select(max_cases))
@@ -619,11 +650,18 @@ def selection_for_lane(lane: str, module: Any, max_cases: int | None) -> dict[st
         for item in all_configurations
         if isinstance(item, dict) and str(item.get("subset") or "").upper() == "MH"
     ]
-    capped = _cap(mh, max_cases)
+    interleaved = _interleave_contexts(mh, list(selection.get("context_tokens") or []))
+    capped = _cap(interleaved, max_cases)
     selection["configurations"] = capped
     selection["effective_denominator"] = len(capped)
     selection["selected_subset"] = "MH"
     selection["subset_filter_applied_before_cap"] = True
+    context_denominators: dict[str, int] = {}
+    for item in capped:
+        if isinstance(item, dict):
+            key = str(item.get("context_tokens"))
+            context_denominators[key] = context_denominators.get(key, 0) + 1
+    selection["context_denominators"] = context_denominators
     return selection
 
 
@@ -712,6 +750,61 @@ def _answer_in_fact(answer: Any, fact_text: str) -> bool:
     return bool(needle) and needle in " ".join(fact_text.split()).casefold()
 
 
+def _norm_fact_text(value: Any) -> str:
+    """Whitespace-normalized fact text used for template comparison."""
+    return " ".join(str(value or "").split())
+
+
+def _template_pairs(
+    facts: list[tuple[int, str]], gold_answers: list[Any]
+) -> list[tuple[int, int]]:
+    """Find (true serial, rewrite serial) pairs by shared subject template.
+
+    A fact containing a gold answer is a rewrite candidate: split its normalized
+    text around that answer into (prefix, suffix). Another fact with the same
+    prefix/suffix but a different middle value is the superseded true fact; the
+    rewrite middle must equal the gold answer. The serials are pinned fact
+    indices, not a temporal ordering -- a rewrite index can be lower than its
+    true counterpart -- so the index is never used to decide which is newer.
+    """
+    pairs: list[tuple[int, int]] = []
+    for rewrite_serial, rewrite_text in facts:
+        hay = _norm_fact_text(rewrite_text)
+        low = hay.casefold()
+        for answer in gold_answers:
+            needle = _norm_fact_text(answer).casefold()
+            if not needle:
+                continue
+            start = 0
+            while True:
+                position = low.find(needle, start)
+                if position < 0:
+                    break
+                prefix, suffix = hay[:position], hay[position + len(needle):]
+                prefix_fold, suffix_fold = prefix.casefold(), suffix.casefold()
+                for true_serial, true_text in facts:
+                    if true_serial == rewrite_serial:
+                        continue
+                    other = _norm_fact_text(true_text)
+                    other_fold = other.casefold()
+                    if not (
+                        other_fold.startswith(prefix_fold)
+                        and other_fold.endswith(suffix_fold)
+                    ):
+                        continue
+                    if len(other) <= len(prefix) + len(suffix):
+                        continue
+                    middle = (
+                        other[len(prefix): len(other) - len(suffix)]
+                        if suffix
+                        else other[len(prefix):]
+                    )
+                    if middle.strip() and middle.casefold() != needle:
+                        pairs.append((true_serial, rewrite_serial))
+                start = position + 1
+    return pairs
+
+
 def _build_mab_rows(
     selection: dict[str, Any],
     dataset: Any,
@@ -729,7 +822,7 @@ def _build_mab_rows(
             if f"factconsolidation_{subset.lower()}_" in source:
                 by_subset[subset].append(record)
     for records in by_subset.values():
-        records.sort(key=lambda item: str(item.get("source")))
+        records.sort(key=lambda item: str((item.get("metadata") or {}).get("source")))
 
     rows: list[dict[str, Any]] = []
     failures: list[str] = []
@@ -762,17 +855,17 @@ def _build_mab_rows(
         gold_answers = answers[question_index] if question_index < len(answers) else []
         if not isinstance(gold_answers, list):
             gold_answers = [gold_answers]
-        matching = [
-            serial
-            for serial, text in facts
-            if any(_answer_in_fact(answer, text) for answer in gold_answers)
-        ]
-        if len(matching) < 2:
-            failures.append(f"{subset}: fewer than two answer-bearing facts")
+        pairs = _template_pairs(facts, gold_answers)
+        if not pairs:
+            failures.append(f"{subset}: no true/rewrite fact pair for pinned question")
             continue
-        older_serial, newer_serial = sorted(matching)[-2:]
-        older_text = dict(facts)[older_serial]
-        newer_text = dict(facts)[newer_serial]
+        # The index is only a deterministic tiebreak between candidate pairs;
+        # older/newer are assigned by role (true fact vs rewrite fact), never by
+        # comparing the two numeric fact indices.
+        older_serial, newer_serial = sorted(pairs, key=lambda pair: (pair[1], pair[0]))[-1]
+        fact_by_serial = dict(facts)
+        older_text = fact_by_serial[older_serial]
+        newer_text = fact_by_serial[newer_serial]
         if _SERIAL.search(older_text) or _SERIAL.search(newer_text):
             failures.append(f"{subset}: pinned fact text already carries a serial marker")
             continue
@@ -1126,6 +1219,7 @@ def model_lane_result(
             "preparation": preparation,
             "selection": {
                 "effective_denominator": total,
+                "context_denominators": selection.get("context_denominators"),
                 "selected_subset": selection.get("selected_subset"),
                 "subset_filter_applied_before_cap": bool(
                     selection.get("subset_filter_applied_before_cap", False)
