@@ -339,6 +339,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--reader-model", default=adapter.READER_MODEL)
     parser.add_argument("--judge-model", default=adapter.JUDGE_MODEL)
     parser.add_argument("--keys", type=int, default=0, help="use at most N loaded keys (0 = all)")
+    parser.add_argument(
+        "--keys-file", default=None,
+        help="path to the KILO key env file (or set MEMNOTH_KEYS_FILE); a path, never a key value",
+    )
     parser.add_argument("--checkpoint-dir", default=str(DEFAULT_CHECKPOINT_DIR))
     parser.add_argument("--dataset-dir", default=str(DEFAULT_DATASET_DIR))
     return parser.parse_args(argv)
@@ -355,7 +359,11 @@ def main(argv: list[str] | None = None) -> int:
     result_path = RESULTS_DIR / f"beam_{args.tier}_{args.max_cases}.json"
     checkpoint_path = checkpoint_dir / f"beam_{args.tier}_checkpoint.jsonl"
 
-    all_keys = load_keys()  # counts only; values are never printed or written
+    # Pass an explicit --keys-file straight to load_keys(). kilo_pool freezes
+    # DEFAULT_KEYS_PATH at import time, so setting the env var here would be too
+    # late; the explicit path is the robust route. Counts only; values and the
+    # path itself are never printed or written.
+    all_keys = load_keys(args.keys_file) if args.keys_file else load_keys()
     keys = all_keys[: args.keys] if args.keys else all_keys
     print(f"keys_loaded: {len(keys)} (values withheld)")
 

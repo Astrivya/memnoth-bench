@@ -11,6 +11,16 @@ in dry-run output (its path value is redacted). Every emitted envelope is
 stamped official=False / diagnostic="derived" / score_asserted=False; counts
 are passed through with their own denominators and are never aggregated into
 a score or a comparison.
+
+KEY-FILE MECHANISM (one mechanism, no duplication)
+--------------------------------------------------
+The path travels to each child runner ONLY through ``MEMNOTH_KEYS_FILE`` in
+``build_env``. The child imports ``kilo_pool`` at process start, so it freezes
+``DEFAULT_KEYS_PATH`` from that env var before any runner code runs; the
+standalone ``load_keys()`` default therefore sees it. Deliberately NO
+``--keys-file`` argument is appended here -- that flag exists for *direct*
+runner invocation, where no launcher sets the env var. Passing both would
+duplicate the path in args and env. Keep env as the launcher's sole path.
 """
 
 from __future__ import annotations
@@ -182,7 +192,11 @@ def build_env(args: argparse.Namespace, lane: str) -> dict[str, str]:
 
 
 def build_command(args: argparse.Namespace, lane: str) -> list[str]:
-    """Argument list for the EXISTING runner; no runner logic is duplicated."""
+    """Argument list for the EXISTING runner; no runner logic is duplicated.
+
+    No ``--keys-file`` is appended: the path is carried solely by
+    ``MEMNOTH_KEYS_FILE`` in the child env (see build_env / module docstring).
+    """
     checkpoint_dir = Path(args.checkpoint_dir).expanduser().resolve()
     results_dir = Path(args.results_dir).expanduser().resolve()
     cmd = [sys.executable, str(ROOT / "runner" / SCRIPTS[lane])]

@@ -529,6 +529,10 @@ def write_report(path: Path, rows: list[dict[str, Any]], q_ids: list[str], seed:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workers", type=int, default=5, help="parallel model calls (default 5)")
+    parser.add_argument(
+        "--keys-file", default=None,
+        help="path to the KILO key env file (or set MEMNOTH_KEYS_FILE); a path, never a key value",
+    )
     parser.add_argument("--check-facts", action="store_true",
                         help="verify seed/recall/asof only; no model calls, no checkpoint")
     return parser.parse_args(argv)
@@ -554,7 +558,11 @@ def main(argv: list[str] | None = None) -> int:
     if bin_path is None:
         print("blocker: mn binary not found")
         return 2
-    keys = load_keys()  # counts only; values never printed or written
+    # Pass an explicit --keys-file straight to load_keys(). kilo_pool freezes
+    # DEFAULT_KEYS_PATH at import time, so setting the env var here would be too
+    # late; the explicit path is the robust route. Counts only; values and the
+    # path itself are never printed or written.
+    keys = load_keys(args.keys_file) if args.keys_file else load_keys()
     print(f"keys_loaded: {len(keys)} (values withheld)")
     if not keys:
         print("blocker: no keys configured")

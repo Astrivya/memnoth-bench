@@ -341,6 +341,10 @@ def main(argv: list[str] | None = None) -> int:
         default=0,
         help="limit the round-robin pool to the first N loaded keys; 0 means all",
     )
+    parser.add_argument(
+        "--keys-file", default=None,
+        help="path to the KILO key env file (or set MEMNOTH_KEYS_FILE); a path, never a key value",
+    )
     args = parser.parse_args(argv)
     mode = str(args.mode)
     if args.max_cases < 0 or args.max_keys < 0:
@@ -350,7 +354,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.max_cases:
         cases = cases[: args.max_cases]
 
-    all_keys = load_keys()
+    # Pass an explicit --keys-file straight to load_keys(). kilo_pool freezes
+    # DEFAULT_KEYS_PATH at import time, so setting the env var here would be too
+    # late; the explicit path is the robust route. Values are never disclosed.
+    all_keys = load_keys(args.keys_file) if args.keys_file else load_keys()
     if not all_keys:
         raise RuntimeError("no KILO keys loaded; set KILO_API_KEY/KILOCODE_API_KEY or the env file")
     keys = all_keys[: args.max_keys] if args.max_keys else all_keys
