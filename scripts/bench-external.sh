@@ -26,7 +26,7 @@
 #   swebench-mini is never a default; it also needs --include-swebench.
 #
 # OVERRIDES (all optional; pin these to your own checkout before trusting output)
-#   BENCH_EXTERNAL_OUT        output root (default D:/temp/opencode/bench-external)
+#   BENCH_EXTERNAL_OUT        output root (default a local scratch directory)
 #   PYTHON_BIN                python executable (default python3, then python)
 #   BENCH_LANE_TIMEOUT_SECS   per-command timeout (default 900)
 #   TAU_AGENT_KEY_NAME        env var name holding the agent key
@@ -61,7 +61,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CLI_REPO="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 cd "$CLI_REPO"
 
-OUT_ROOT="${BENCH_EXTERNAL_OUT:-D:/temp/opencode/bench-external}"
+OUT_ROOT="${BENCH_EXTERNAL_OUT:-${TMPDIR:-/tmp}/memnoth-bench-external}"
 RUN_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 RUN_TAG="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 RUN_DIR="$OUT_ROOT/$RUN_TAG"

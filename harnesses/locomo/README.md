@@ -14,8 +14,8 @@
 - Artifact SHA-256 (`DATASET_SHA256` in `adapter.py`):
   `79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4`
   Computed from one real download of the exact pinned URL to
-  `D:/temp/opencode/locomo10.json` (outside the repository) with
-  `Get-FileHash -Algorithm SHA256 D:/temp/opencode/locomo10.json`. The artifact is
+  a local scratch copy of `locomo10.json` (outside the repository) with
+  `Get-FileHash -Algorithm SHA256 <local-scratch-path>/locomo10.json`. The artifact is
   **not** vendored.
 - Local path after verification: `data/locomo/locomo_conversation.json` (gitignored).
 - Judge pin (optional lane): `gpt-4o-2024-08-06`, temperature `0` (`JUDGE`). Records the pin only; `enforced_by_adapter: false`.
