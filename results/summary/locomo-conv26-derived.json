@@ -1,0 +1,24 @@
+{
+  "id": "locomo-conv26-5q-derived",
+  "lane": "locomo-small",
+  "label": "LoCoMo conv-26 pinned 5-question token-F1 smoke slice (derived, Tier C)",
+  "value": "2/5",
+  "denominator": {
+    "n": 5,
+    "unit": "questions"
+  },
+  "ci": null,
+  "dataset_version": "79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4",
+  "judge_version": "baidu/ernie-5.5-flash-preview:free",
+  "provenance": "memnoth-bench/results/raw/locomo_conv0_max5.json; dataset: memnoth-bench/data/locomo/locomo_conversation.json",
+  "metric_definition": "local token F1 exact-match on 5 pinned conv-26 questions",
+  "observed_date": "2026-11-24",
+  "observed_at": "2026-11-24T13:55:03Z",
+  "official": false,
+  "diagnostic": "derived",
+  "note": "INFORMATIONAL ONLY — derived Tier C diagnostic smoke slice; no rank, no win, no official score asserted.",
+  "comparability_tier": "C",
+  "reader_model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+  "judge_model": "baidu/ernie-5.5-flash-preview:free",
+  "score_asserted": false
+}

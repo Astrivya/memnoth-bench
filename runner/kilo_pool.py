@@ -20,12 +20,44 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-DEFAULT_KEYS_PATH = r"D:\temp\opencode\kilo-keys.env"
-"""Local env file holding six KILO_KEY_* names. Referenced by path only."""
+# Machine-specific keys paths must NEVER be committed. Supply via env var
+# MEMNOTH_KEYS_FILE at run time; the in-repo default is a non-existent local file.
+DEFAULT_KEYS_PATH = os.environ.get("MEMNOTH_KEYS_FILE", "kilo-keys.env")
+"""Key file path: env ``MEMNOTH_KEYS_FILE`` or a local, ignored fallback name. Referenced by name only."""
 
 _ENV_KEY_NAMES = ("KILO_API_KEY", "KILOCODE_API_KEY")
 _KEY_NAME = re.compile(r"^KILO_KEY_[A-Za-z0-9_]*$")
 _BURST = 6  # cap exponential backoff at 2**6 * base before the absolute cap
+
+# Gentler defaults. The former 60s -> 900s schedule cooled every key under
+# sustained multi-worker load, so get() had nothing left to hand out. Each of
+# these knobs is overridable per instance or by an env var (names only; these
+# are tuning values, never key values). Nothing here logs or prints a key.
+DEFAULT_COOLDOWN_SECONDS = 15.0
+DEFAULT_MAX_COOLDOWN_SECONDS = 120.0
+DEFAULT_WAIT_SECONDS = 2.0
+COOLDOWN_ENV = "MEMNOTH_KEY_COOLDOWN_SECONDS"
+MAX_COOLDOWN_ENV = "MEMNOTH_KEY_MAX_COOLDOWN_SECONDS"
+WAIT_ENV = "MEMNOTH_KEY_WAIT_SECONDS"
+_POLL_INTERVAL = 0.05  # re-check time-based cooldown expiry while waiting
+
+
+def _env_float(name: str, default: float) -> float:
+    """Return a non-negative float from env var ``name``, else ``default``."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return max(0.0, float(raw.strip()))
+    except (TypeError, ValueError):
+        return default
+
+
+def _resolve_seconds(explicit: float | None, env_name: str, default: float) -> float:
+    """Explicit constructor value wins, then env var, then the gentle default."""
+    if explicit is not None:
+        return max(0.0, float(explicit))
+    return _env_float(env_name, default)
 
 
 def load_keys(path: str | Path = DEFAULT_KEYS_PATH) -> list[str]:
@@ -100,16 +132,20 @@ class KeyPool:
     clears that state and, for a 429/5xx failure, cools that one key down for an
     exponentially growing interval. All state is guarded by a single lock, so
     concurrent callers never receive the same key and cooldown bookkeeping is
-    atomic. When every key is in use or cooling, ``get()`` returns ``None`` --
-    it never fabricates a key and never silently reuses a cooled one.
+    atomic. When every key is in use or cooling, ``get()`` waits up to a bounded
+    ``wait_seconds`` for a slot to free up before returning ``None`` -- it never
+    fabricates a key and never silently reuses a cooled one. Cooldown starts at
+    15s and caps at 120s by default (env-tunable), replacing the old 60s -> 900s
+    schedule that cooled every key under sustained load.
     """
 
     def __init__(
         self,
         keys: Iterable[str],
         *,
-        cooldown_seconds: float = 60.0,
-        max_cooldown_seconds: float = 900.0,
+        cooldown_seconds: float | None = None,
+        max_cooldown_seconds: float | None = None,
+        wait_seconds: float | None = None,
     ) -> None:
         unique: list[str] = []
         seen: set[str] = set()
@@ -125,24 +161,47 @@ class KeyPool:
         self._by_key = {value: index for index, value in enumerate(unique)}
         self._cursor = 0
         self._lock = threading.RLock()
-        self._base_cooldown = max(0.0, float(cooldown_seconds))
-        self._max_cooldown = max(0.0, float(max_cooldown_seconds))
+        self._cond = threading.Condition(self._lock)
+        self._base_cooldown = _resolve_seconds(
+            cooldown_seconds, COOLDOWN_ENV, DEFAULT_COOLDOWN_SECONDS
+        )
+        self._max_cooldown = _resolve_seconds(
+            max_cooldown_seconds, MAX_COOLDOWN_ENV, DEFAULT_MAX_COOLDOWN_SECONDS
+        )
+        self._default_wait = _resolve_seconds(wait_seconds, WAIT_ENV, DEFAULT_WAIT_SECONDS)
         self._unknown_releases = 0
 
-    def get(self) -> str | None:
-        """Return the next available key, or ``None`` if all are busy/cooling."""
-        with self._lock:
-            now = time.monotonic()
-            count = len(self._slots)
-            for step in range(count):
-                index = (self._cursor + step) % count
-                slot = self._slots[index]
-                if slot.in_use or slot.cooldown_until > now:
-                    continue
-                self._cursor = (index + 1) % count
-                slot.in_use = True
-                return slot.key
-            return None
+    def get(self, wait_seconds: float | None = None) -> str | None:
+        """Return the next available key, waiting briefly if none is free.
+
+        ``wait_seconds`` defaults to this pool's configured wait (env-tunable,
+        default 2s). Passing ``0`` reproduces the old immediate-``None``
+        behaviour. The lock is never held while waiting, so other threads can
+        release keys or let cooldowns expire and wake this caller. A key is
+        still never handed out while in use or cooling.
+        """
+        wait = (
+            self._default_wait
+            if wait_seconds is None
+            else max(0.0, float(wait_seconds))
+        )
+        deadline = time.monotonic() + wait
+        with self._cond:
+            while True:
+                now = time.monotonic()
+                count = len(self._slots)
+                for step in range(count):
+                    index = (self._cursor + step) % count
+                    slot = self._slots[index]
+                    if slot.in_use or slot.cooldown_until > now:
+                        continue
+                    self._cursor = (index + 1) % count
+                    slot.in_use = True
+                    return slot.key
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return None
+                self._cond.wait(timeout=min(remaining, _POLL_INTERVAL))
 
     def release(self, key: str, success: bool, status_code: int | None) -> bool:
         """Release ``key``; cool it down on 429/5xx failures.
@@ -152,7 +211,7 @@ class KeyPool:
         resets the failure streak but does not cancel an active time-based
         cooldown: cooldowns expire on their own.
         """
-        with self._lock:
+        with self._cond:
             index = self._by_key.get(key)
             if index is None:
                 self._unknown_releases += 1
@@ -162,15 +221,16 @@ class KeyPool:
             if success:
                 slot.failures = 0
                 slot.successes += 1
-                return True
-            slot.failures += 1
-            if _is_rate_limit(status_code):
-                slot.rate_limited += 1
-                delay = self._base_cooldown * (2 ** min(slot.failures - 1, _BURST))
-                delay = min(delay, self._max_cooldown) if self._max_cooldown else delay
-                slot.cooldown_until = max(
-                    slot.cooldown_until, time.monotonic() + delay
-                )
+            else:
+                slot.failures += 1
+                if _is_rate_limit(status_code):
+                    slot.rate_limited += 1
+                    delay = self._base_cooldown * (2 ** min(slot.failures - 1, _BURST))
+                    delay = min(delay, self._max_cooldown) if self._max_cooldown else delay
+                    slot.cooldown_until = max(
+                        slot.cooldown_until, time.monotonic() + delay
+                    )
+            self._cond.notify_all()  # a waiting get() may now claim this slot
             return True
 
     def stats(self) -> dict[str, Any]:
@@ -218,7 +278,13 @@ def _smoke() -> int:
         print("key_source: none found; using a labelled synthetic placeholder")
 
     pool_keys = keys or ["synthetic-placeholder-not-a-real-key"]
-    pool = KeyPool(pool_keys, cooldown_seconds=0.3, max_cooldown_seconds=0.6)
+    # Explicit wait=0 keeps this smoke's original immediate-return semantics.
+    pool = KeyPool(
+        pool_keys,
+        cooldown_seconds=0.3,
+        max_cooldown_seconds=0.6,
+        wait_seconds=0.0,
+    )
 
     first = pool.get()
     assert first is not None, "get() must hand out an available key"
