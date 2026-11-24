@@ -42,7 +42,7 @@ _FACT_CHARS = 800
 _CONTEXT_CHARS = 6000
 _QUESTION_CHARS = 1000
 _ANSWER_CHARS = 300
-_RETRIES = 3          # retries after the first attempt, on 429 / 5xx only
+_RETRIES = 3          # retries after the first attempt, on 429 / 5xx / empty answer
 _TIMEOUT_SECONDS = 60
 # The frozen 550B reader and ernie judge are reasoning models: the final answer
 # only appears after ~1k reasoning tokens. BEAM's adapter proved 1024 works on
@@ -249,6 +249,13 @@ def _post_json(
                 message = choices[0].get("message")
             content = message.get("content") if isinstance(message, dict) else None
             if not isinstance(content, str) or not content.strip():
+                # A blank/None content is a transient gateway failure (e.g. a
+                # reasoning model emitting zero visible tokens), not a real
+                # answer. Retry it like 429/5xx within the same bounded budget;
+                # no raw body or key is logged, only the short code on exhaustion.
+                if attempt < _RETRIES:
+                    time.sleep(min(2**attempt, 8))
+                    continue
                 return None, "empty_answer"
             return content.strip(), None
     return None, "unavailable"
