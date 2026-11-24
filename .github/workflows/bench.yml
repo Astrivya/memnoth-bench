@@ -1,0 +1,446 @@
+# Public, reproducible benchmarks for the Memnoth CLI/MCP public surface.
+#
+# DERIVED / NOT OFFICIAL. Every lane result is informational: it is produced by
+# a locally constructed harness against pinned IDs (fixtures/pinned-ids.json),
+# not an official split of any upstream benchmark. Provider-keyed lanes are
+# informational comparisons only — no "#1" / "best" claim is made from them
+# without a paired run on the same pinned harness. See README.md.
+#
+# PUBLIC REPO / FREE MINUTES: standard GitHub-hosted runners for a public repo
+# are currently covered by GitHub's free public-repository Actions allotment.
+# Free-minute rules, runner multipliers and storage retention CHANGE — verify
+# the CURRENT limits in GitHub's billing docs before relying on them
+# (PIN_BEFORE_USE: re-confirm at enable time). Provider API spend is a separate
+# cost and is gated by --confirm_spend; Actions minutes are not the spend gate.
+#
+# NO pull_request TRIGGER — intentionally. Fork PRs must never execute keyed /
+# spend lanes, and untrusted PR code must never run with repository secrets.
+# PRs are validated read-only by verify.yml; this workflow runs only on push to
+# main (model-free smoke), nightly schedule, and explicit dispatch.
+
+name: bench
+
+on:
+  schedule:
+    # Nightly, 03:17 UTC. Avoid the top-of-hour scheduler rush.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      lane:
+        description: 'Lane to run (all = every provider-keyed lane; schedule ignores this and runs all)'
+        type: choice
+        required: true
+        default: all
+        options:
+          - all
+          - memoryagentbench-mh
+          - longmemeval-temporal
+          - locomo-small
+      max_cases:
+        description: 'Maximum cases per lane (HARD CAP 50; guardrail fails closed above it)'
+        type: number
+        required: true
+        default: 30
+      confirm_spend:
+        description: 'I understand this may incur provider API spend (BYOK, no markup)'
+        type: boolean
+        required: false
+        default: false
+  push:
+    branches: [main]
+    # Push to main is a TINY MODEL-FREE SMOKE ONLY. Lane jobs below are gated
+    # off on push, so no keys and no spend are ever used on an ordinary push.
+
+# Cancel a superseded *dispatch* run; nightly/push runs are left to finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
+
+permissions:
+  contents: read # This workflow verifies and uploads artifacts; it COMMITS NOTHING.
+
+jobs:
+  smoke:
+    name: smoke (model-free, no keys)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # Flip to 'true' only after replacing PIN_BEFORE_USE in the install step.
+      INSTALL_PINNED_CLI: 'false'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # The runner calls the PUBLIC mn binary and expects MN_BIN to point at it,
+      # or a compatible mn to be on PATH. A public CLI must therefore be
+      # installed/provided by the runner. Two supported options:
+      #   1. (current) leave MN_BIN unset and ensure a public `mn` is on PATH;
+      #      the runner fails loudly if neither is available — no fake score.
+      #   2. enable the pinned public-release download below after replacing
+      #      PIN_BEFORE_USE with a real public release tag AND its SHA-256 from
+      #      https://github.com/Astrivya/memnoth/releases (see targets/cli.lock).
+      - name: Install pinned public mn CLI (OPTIONAL — disabled until pinned)
+        if: ${{ env.INSTALL_PINNED_CLI == 'true' }}
+        env:
+          # PIN_BEFORE_USE: real public tag + SHA-256 from the public repo releases.
+          MN_VERSION: 'PIN_BEFORE_USE'
+          MN_SHA256: 'PIN_BEFORE_USE'
+        run: |
+          set -euo pipefail
+          url="https://github.com/Astrivya/memnoth/releases/download/${MN_VERSION}/mn-linux-x86_64.tar.gz"
+          curl -fsSL "$url" -o /tmp/mn.tar.gz
+          echo "${MN_SHA256}  /tmp/mn.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/mn.tar.gz -C "$HOME/.local/bin" mn
+          echo "MN_BIN=$HOME/.local/bin/mn" >> "$GITHUB_ENV"
+
+      # Model-free. Reads no provider keys and makes no spend. Still fails
+      # visibly if the CLI surface is missing — never masked with `|| true`.
+      - name: Run model-free smoke
+        continue-on-error: false
+        run: python runner/bench.py smoke
+
+      - name: Upload smoke results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-smoke
+          path: |
+            results/
+            manifest*.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  memoryagentbench-mh:
+    name: memoryagentbench-mh (provider-keyed, informational)
+    if: >-
+      ${{ (github.event_name == 'schedule' ||
+           (github.event_name == 'workflow_dispatch' && inputs.confirm_spend == true)) &&
+          (github.event_name == 'schedule' ||
+           inputs.lane == 'all' || inputs.lane == 'memoryagentbench-mh') }}
+    needs: [smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache judge responses
+        uses: actions/cache@v4
+        with:
+          path: cache/judge
+          key: ${{ runner.os }}-judge-${{ hashFiles('runner/**', 'adapters/**', 'fixtures/**') }}
+          restore-keys: ${{ runner.os }}-judge-
+
+      - name: Cache downloaded datasets
+        # Datasets are NEVER committed. data/ is gitignored; the runner fetches
+        # pinned URLs/revisions at runtime and verifies SHA-256. Cache is a
+        # speed-up only, keyed by the pinned question IDs.
+        uses: actions/cache@v4
+        with:
+          path: data/
+          key: ${{ runner.os }}-data-${{ hashFiles('fixtures/**') }}
+          restore-keys: ${{ runner.os }}-data-
+
+      # Keys are referenced BY NAME only. Values are injected by GitHub from
+      # repo secrets and are never echoed, logged, or written to an artifact.
+      - name: Guardrails — cap cases, estimate spend, fail closed on missing keys
+        env:
+          LANE: memoryagentbench-mh
+          MAX_CASES: ${{ inputs.max_cases || 30 }}
+          REQUIRED_KEYS: KILO_API_KEY,OPENAI_API_KEY
+          # PIN_BEFORE_USE: replace with the current provider price table.
+          ESTIMATED_COST_PER_CASE_USD: '0.02'
+          KILO_API_KEY: ${{ secrets.KILO_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          python - <<'PY'
+          import json, os, pathlib, sys
+
+          lane = os.environ["LANE"]
+          max_cases = int(os.environ["MAX_CASES"])
+          if not (1 <= max_cases <= 50):
+              sys.exit(f"FAIL CLOSED: MAX_CASES={max_cases} outside [1,50]; refusing to spend")
+
+          per_case = float(os.environ["ESTIMATED_COST_PER_CASE_USD"])
+          estimate = max_cases * per_case
+          print(f"::notice title=Cost guardrail::{lane}: max_cases={max_cases} (cap 50); "
+                f"estimated upper-bound provider spend ~${estimate:.2f} USD "
+                f"(BYOK/no markup; PIN_BEFORE_USE price estimate).")
+
+          missing = [k for k in os.environ["REQUIRED_KEYS"].split(",") if not os.environ.get(k)]
+          if missing:
+              out = pathlib.Path("results/summary")
+              out.mkdir(parents=True, exist_ok=True)
+              rec = {
+                  "lane": lane,
+                  "official": False,
+                  "status": "skipped",
+                  "denominator": 0,
+                  "limitation": "missing provider key(s): " + ", ".join(missing),
+              }
+              (out / f"{lane}.skipped.json").write_text(json.dumps(rec, indent=2) + "\n")
+              sys.exit("FAIL CLOSED: missing " + ", ".join(missing) +
+                       " — no score produced (limitation record written).")
+          print("Provider keys present by name only; values are never printed.")
+          PY
+
+      - name: Run lane
+        # --max-cases uses a `|| 30` fallback because inputs.* is empty on schedule.
+        continue-on-error: false
+        run: python runner/bench.py run --lane memoryagentbench-mh --confirm-spend --max-cases ${{ inputs.max_cases || 30 }}
+
+      # If the guardrail failed closed, the skipped-limitation JSON lands here:
+      # jobs have separate workspaces, so artifacts are how the limitation is
+      # reported downstream. It is never turned into a score.
+      - name: Upload raw results + manifest (90 days)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-raw-memoryagentbench-mh
+          path: |
+            results/raw/
+            results/summary/
+            manifest*.json
+            results/**/manifest*.json
+          if-no-files-found: warn
+          retention-days: 90
+
+  longmemeval-temporal:
+    name: longmemeval-temporal (provider-keyed, informational)
+    if: >-
+      ${{ (github.event_name == 'schedule' ||
+           (github.event_name == 'workflow_dispatch' && inputs.confirm_spend == true)) &&
+          (github.event_name == 'schedule' ||
+           inputs.lane == 'all' || inputs.lane == 'longmemeval-temporal') }}
+    needs: [smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache judge responses
+        uses: actions/cache@v4
+        with:
+          path: cache/judge
+          key: ${{ runner.os }}-judge-${{ hashFiles('runner/**', 'adapters/**', 'fixtures/**') }}
+          restore-keys: ${{ runner.os }}-judge-
+
+      - name: Cache downloaded datasets
+        # Datasets are NEVER committed. data/ is gitignored; the runner fetches
+        # pinned URLs/revisions at runtime and verifies SHA-256. Cache is a
+        # speed-up only, keyed by the pinned question IDs.
+        uses: actions/cache@v4
+        with:
+          path: data/
+          key: ${{ runner.os }}-data-${{ hashFiles('fixtures/**') }}
+          restore-keys: ${{ runner.os }}-data-
+
+      - name: Guardrails — cap cases, estimate spend, fail closed on missing keys
+        env:
+          LANE: longmemeval-temporal
+          MAX_CASES: ${{ inputs.max_cases || 30 }}
+          REQUIRED_KEYS: OPENAI_API_KEY
+          # PIN_BEFORE_USE: replace with the current judge provider price table.
+          ESTIMATED_COST_PER_CASE_USD: '0.02'
+          KILO_API_KEY: ${{ secrets.KILO_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          python - <<'PY'
+          import json, os, pathlib, sys
+
+          lane = os.environ["LANE"]
+          max_cases = int(os.environ["MAX_CASES"])
+          if not (1 <= max_cases <= 50):
+              sys.exit(f"FAIL CLOSED: MAX_CASES={max_cases} outside [1,50]; refusing to spend")
+
+          per_case = float(os.environ["ESTIMATED_COST_PER_CASE_USD"])
+          estimate = max_cases * per_case
+          print(f"::notice title=Cost guardrail::{lane}: max_cases={max_cases} (cap 50); "
+                f"estimated upper-bound provider spend ~${estimate:.2f} USD "
+                f"(BYOK/no markup; PIN_BEFORE_USE price estimate).")
+
+          missing = [k for k in os.environ["REQUIRED_KEYS"].split(",") if not os.environ.get(k)]
+          if missing:
+              out = pathlib.Path("results/summary")
+              out.mkdir(parents=True, exist_ok=True)
+              rec = {
+                  "lane": lane,
+                  "official": False,
+                  "status": "skipped",
+                  "denominator": 0,
+                  "limitation": "missing provider key(s): " + ", ".join(missing),
+              }
+              (out / f"{lane}.skipped.json").write_text(json.dumps(rec, indent=2) + "\n")
+              sys.exit("FAIL CLOSED: missing " + ", ".join(missing) +
+                       " — no score produced (limitation record written).")
+          print("Provider keys present by name only; values are never printed.")
+          PY
+
+      - name: Run lane
+        # --max-cases uses a `|| 30` fallback because inputs.* is empty on schedule.
+        continue-on-error: false
+        run: python runner/bench.py run --lane longmemeval-temporal --confirm-spend --max-cases ${{ inputs.max_cases || 30 }}
+
+      - name: Upload raw results + manifest (90 days)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-raw-longmemeval-temporal
+          path: |
+            results/raw/
+            results/summary/
+            manifest*.json
+            results/**/manifest*.json
+          if-no-files-found: warn
+          retention-days: 90
+
+  locomo-small:
+    name: locomo-small (provider-keyed, informational)
+    if: >-
+      ${{ (github.event_name == 'schedule' ||
+           (github.event_name == 'workflow_dispatch' && inputs.confirm_spend == true)) &&
+          (github.event_name == 'schedule' ||
+           inputs.lane == 'all' || inputs.lane == 'locomo-small') }}
+    needs: [smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache judge responses
+        uses: actions/cache@v4
+        with:
+          path: cache/judge
+          key: ${{ runner.os }}-judge-${{ hashFiles('runner/**', 'adapters/**', 'fixtures/**') }}
+          restore-keys: ${{ runner.os }}-judge-
+
+      - name: Cache downloaded datasets
+        # Datasets are NEVER committed. data/ is gitignored; the runner fetches
+        # pinned URLs/revisions at runtime and verifies SHA-256. Cache is a
+        # speed-up only, keyed by the pinned question IDs.
+        uses: actions/cache@v4
+        with:
+          path: data/
+          key: ${{ runner.os }}-data-${{ hashFiles('fixtures/**') }}
+          restore-keys: ${{ runner.os }}-data-
+
+      - name: Guardrails — cap cases, estimate spend, fail closed on missing keys
+        env:
+          LANE: locomo-small
+          MAX_CASES: ${{ inputs.max_cases || 30 }}
+          REQUIRED_KEYS: OPENAI_API_KEY
+          # PIN_BEFORE_USE: replace with the current judge provider price table.
+          ESTIMATED_COST_PER_CASE_USD: '0.02'
+          KILO_API_KEY: ${{ secrets.KILO_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          python - <<'PY'
+          import json, os, pathlib, sys
+
+          lane = os.environ["LANE"]
+          max_cases = int(os.environ["MAX_CASES"])
+          if not (1 <= max_cases <= 50):
+              sys.exit(f"FAIL CLOSED: MAX_CASES={max_cases} outside [1,50]; refusing to spend")
+
+          per_case = float(os.environ["ESTIMATED_COST_PER_CASE_USD"])
+          estimate = max_cases * per_case
+          print(f"::notice title=Cost guardrail::{lane}: max_cases={max_cases} (cap 50); "
+                f"estimated upper-bound provider spend ~${estimate:.2f} USD "
+                f"(BYOK/no markup; PIN_BEFORE_USE price estimate).")
+
+          missing = [k for k in os.environ["REQUIRED_KEYS"].split(",") if not os.environ.get(k)]
+          if missing:
+              out = pathlib.Path("results/summary")
+              out.mkdir(parents=True, exist_ok=True)
+              rec = {
+                  "lane": lane,
+                  "official": False,
+                  "status": "skipped",
+                  "denominator": 0,
+                  "limitation": "missing provider key(s): " + ", ".join(missing),
+              }
+              (out / f"{lane}.skipped.json").write_text(json.dumps(rec, indent=2) + "\n")
+              sys.exit("FAIL CLOSED: missing " + ", ".join(missing) +
+                       " — no score produced (limitation record written).")
+          print("Provider keys present by name only; values are never printed.")
+          PY
+
+      - name: Run lane
+        # --max-cases uses a `|| 30` fallback because inputs.* is empty on schedule.
+        continue-on-error: false
+        run: python runner/bench.py run --lane locomo-small --confirm-spend --max-cases ${{ inputs.max_cases || 30 }}
+
+      - name: Upload raw results + manifest (90 days)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-raw-locomo-small
+          path: |
+            results/raw/
+            results/summary/
+            manifest*.json
+            results/**/manifest*.json
+          if-no-files-found: warn
+          retention-days: 90
+
+  publish-summary:
+    name: publish-summary (verify only, commits nothing)
+    # `always()` keeps this verification step alive even when a lane fails or
+    # is skipped, so limitation records are still checked. It stays OFF on push
+    # (smoke-only runs). This job has no contents:write permission — no commit.
+    if: >-
+      ${{ always() && (
+          github.event_name == 'schedule' ||
+          (github.event_name == 'workflow_dispatch' && inputs.confirm_spend == true)
+        ) }}
+    needs: [memoryagentbench-mh, longmemeval-temporal, locomo-small]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # export/export.py is created by another agent. `--check` is read-only:
+      # it verifies the committed sanitized summary matches generated figures
+      # and must never write or commit anything.
+      - name: Verify sanitized summary matches (--check)
+        continue-on-error: false
+        run: python export/export.py --check
+
+      - name: Upload final report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-report
+          path: |
+            results/summary/
+            docs/
+          if-no-files-found: warn
+          retention-days: 90

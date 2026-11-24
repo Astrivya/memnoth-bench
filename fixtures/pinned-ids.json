@@ -1,0 +1,22 @@
+{
+  "note": "Small pinned slices. Not official splits — constructed locally for fast iteration. Denominators are these exact counts.",
+  "memoryagentbench": {
+    "fact_consolidation_sh": 24,
+    "fact_consolidation_mh": 16,
+    "context_tokens": [4096, 8192],
+    "source": "MQUAKE true+rewrite pairs; structured serial-number conflict guardrail",
+    "official_split": false
+  },
+  "longmemeval": {
+    "slice": "oracle + question_type == temporal-reasoning",
+    "count": 30,
+    "official_split": false,
+    "judge": "gpt-4o-2024-08-06",
+    "judge_temperature": 0
+  },
+  "locomo": {
+    "conversations": 1,
+    "questions": 5,
+    "official_split": false
+  }
+}

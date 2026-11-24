@@ -1,0 +1,236 @@
+# Read-only verification for the public benchmark repo. Runs on every push and
+# PR (including fork PRs) because it needs NO secrets and executes NO provider
+# calls. Every step fails the job on any violation. These checks never edit,
+# format, or commit tracked files.
+
+name: verify
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static-checks:
+    name: read-only repo checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PyYAML (workflow YAML parse only)
+        run: python -m pip install --quiet pyyaml
+
+      # 1. Compile every tracked/untracked Python source. py_compile output goes
+      #    to a temp dir so the repo stays byte-for-byte unchanged.
+      - name: '1. python -m py_compile on all Python files'
+        run: |
+          python - <<'PY'
+          import os, pathlib, py_compile, sys, tempfile
+
+          roots = [pathlib.Path(".")]
+          files = sorted(
+              p for p in pathlib.Path(".").rglob("*.py")
+              if ".git" not in p.parts and ".venv" not in p.parts and "venv" not in p.parts
+          )
+          if not files:
+              print("No Python files found — nothing to compile.")
+              sys.exit(0)
+
+          failures = []
+          with tempfile.TemporaryDirectory() as td:
+              for i, path in enumerate(files):
+                  cfile = os.path.join(td, f"{i}.pyc")
+                  try:
+                      py_compile.compile(str(path), cfile=cfile, doraise=True)
+                  except py_compile.PyCompileError as exc:
+                      failures.append(f"{path}: {exc}")
+          for f in failures:
+              print(f"::error::{f}")
+          if failures:
+              sys.exit(f"py_compile failed for {len(failures)} file(s)")
+          print(f"py_compile OK: {len(files)} file(s).")
+          PY
+
+      # 2. Parse every workflow as YAML. (PyYAML follows YAML 1.1 and reads the
+      #    key `on` as boolean True; that is fine — we only require a clean
+      #    parse, which catches indentation/quoting errors before Actions does.)
+      - name: '2. YAML parse of all workflows'
+        run: |
+          python - <<'PY'
+          import pathlib, sys, yaml
+
+          workflows = sorted(pathlib.Path(".github/workflows").glob("*"))
+          workflows = [p for p in workflows if p.suffix.lower() in (".yml", ".yaml") and p.is_file()]
+          if not workflows:
+              print("No workflow files found — nothing to parse.")
+              sys.exit(0)
+
+          failures = []
+          for path in workflows:
+              try:
+                  data = yaml.safe_load(path.read_text(encoding="utf-8"))
+                  if not isinstance(data, dict):
+                      failures.append(f"{path}: top level is not a mapping")
+              except yaml.YAMLError as exc:
+                  failures.append(f"{path}: {exc}")
+          for f in failures:
+              print(f"::error::{f}")
+          if failures:
+              sys.exit(f"YAML parse failed for {len(failures)} workflow(s)")
+          print(f"YAML parse OK: {len(workflows)} workflow(s).")
+          PY
+
+      # 3. Secrets hygiene. Scan TRACKED files only. The checker excludes
+      #    itself (it contains the patterns as literals) and skips obvious
+      #    placeholders / docs examples so variable names do not false-positive.
+      #    We look for real-looking VALUES, never for variable NAMES.
+      - name: '3. .env ignored + no key VALUES in tracked files'
+        run: |
+          python - <<'PY'
+          import pathlib, re, subprocess, sys
+
+          failures = []
+
+          tracked = subprocess.check_output(["git", "ls-files", "-z"], text=True).split("\0")
+          tracked = [p for p in tracked if p]
+
+          if ".env" in tracked:
+              failures.append(".env is TRACKED — a committed key can only be rotated")
+          if subprocess.run(["git", "check-ignore", "-q", ".env"]).returncode != 0:
+              failures.append(".env is not covered by .gitignore")
+          if ".env.example" not in tracked:
+              failures.append(".env.example must be the only tracked env file")
+
+          # Ordered so the generic api_key literal check can inspect its capture.
+          patterns = [
+              ("openai-style key", re.compile(r"\bsk-[A-Za-z0-9_\-]{20,}"), True),
+              ("github PAT", re.compile(r"\bghp_[A-Za-z0-9]{20,}"), True),
+              ("private key block", re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----"), False),
+              ("hard-coded api_key literal", re.compile(r"(?i)\bapi[_-]?key\s*[:=]\s*[\"']([^\"']{16,})[\"']"), True),
+          ]
+          PLACEHOLDERS = (
+              "your", "example", "placeholder", "changeme", "replace", "dummy",
+              "fake", "sample", "test", "xxx", "todo", "<", ">", "${", "by name",
+              "env", "secret", "api_key", "apikey",
+          )
+
+          def looks_real(value: str) -> bool:
+              v = value.strip()
+              low = v.lower()
+              if any(w in low for w in PLACEHOLDERS):
+                  return False
+              if len(v) < 20 or not re.search(r"\d", v) or not re.search(r"[A-Za-z]", v):
+                  return False
+              return True
+
+          skipped_self = ".github/workflows/verify.yml"
+          scanned = 0
+          for name in tracked:
+              if name == skipped_self:
+                  continue
+              path = pathlib.Path(name)
+              try:
+                  raw = path.read_bytes()
+              except OSError:
+                  continue
+              if len(raw) > 1_000_000 or b"\0" in raw:
+                  continue
+              try:
+                  text = raw.decode("utf-8")
+              except UnicodeDecodeError:
+                  continue
+              scanned += 1
+              for line_no, line in enumerate(text.splitlines(), 1):
+                  for label, regex, needs_entropy in patterns:
+                      for match in regex.finditer(line):
+                          value = match.group(1) if match.groups() else match.group(0)
+                          if needs_entropy and not looks_real(value):
+                              continue
+                          failures.append(
+                              f"{name}:{line_no}: possible {label} VALUE in tracked file "
+                              "— use a repo secret referenced by NAME only"
+                          )
+
+          for f in failures:
+              print(f"::error::{f}")
+          if failures:
+              sys.exit(f"Secrets hygiene failed with {len(failures)} violation(s)")
+          print(f"Secrets hygiene OK: {scanned} tracked file(s) scanned; .env ignored.")
+          PY
+
+      # 4. Every committed summary entry must be explicitly non-official and
+      #    carry a denominator. A scored entry needs denominator > 0; a failure
+      #    is recorded as a `status: skipped` limitation with denominator 0,
+      #    never as a fabricated score. Missing directory = nothing to validate.
+      - name: '4. results/summary invariants (official: false + denominator)'
+        run: |
+          python - <<'PY'
+          import json, pathlib, sys
+
+          root = pathlib.Path("results/summary")
+          if not root.is_dir():
+              print("No results/summary directory yet — nothing to validate.")
+              sys.exit(0)
+
+          entries = sorted(
+              p for p in root.rglob("*")
+              if p.is_file() and p.suffix.lower() in (".json", ".yaml", ".yml")
+          )
+          failures = []
+          for path in entries:
+              text = path.read_text(encoding="utf-8")
+              try:
+                  data = json.loads(text)
+              except json.JSONDecodeError:
+                  try:
+                      import yaml
+                      data = yaml.safe_load(text)
+                  except Exception as exc:
+                      failures.append(f"{path}: not valid JSON/YAML ({exc})")
+                      continue
+              if not isinstance(data, dict):
+                  failures.append(f"{path}: expected an object")
+                  continue
+
+              official = data.get("official")
+              if official is not False and str(official).strip().lower() != "false":
+                  failures.append(f"{path}: missing `official: false` (found {official!r})")
+
+              denom = next(
+                  (data[k] for k in ("denominator", "total", "n_cases", "cases", "n") if k in data),
+                  None,
+              )
+              if denom is None:
+                  failures.append(f"{path}: missing denominator")
+              else:
+                  try:
+                      n = int(denom)
+                  except (TypeError, ValueError):
+                      failures.append(f"{path}: denominator is not an integer ({denom!r})")
+                  else:
+                      is_limitation = data.get("status") == "skipped" and "limitation" in data
+                      if n <= 0 and not is_limitation:
+                          failures.append(f"{path}: scored entry needs denominator > 0")
+                      if n > 0 and is_limitation:
+                          # A skipped limitation must not masquerade as a score.
+                          failures.append(f"{path}: skipped limitation has a scored denominator")
+
+          for f in failures:
+              print(f"::error::{f}")
+          if failures:
+              sys.exit(f"Summary invariants failed with {len(failures)} violation(s)")
+          print(f"Summary invariants OK: {len(entries)} entr(y/ies) checked.")
+          PY

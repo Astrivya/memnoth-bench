@@ -1,0 +1,2 @@
+# Sanitized summaries are written here by export/export.py --write.
+# Raw per-item results belong in results/raw/ (gitignored) and CI artifacts.

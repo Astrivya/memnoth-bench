@@ -1,0 +1,40 @@
+# Secrets and local config — never commit. Only .env.example is tracked.
+.env
+.env.*
+!.env.example
+*.local
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Downloaded datasets and upstream harness checkouts (licenses + size).
+data/
+datasets/
+upstream/
+harnesses/*/vendor/
+
+# Judge and dataset caches — large, reproducible from pins.
+cache/
+*.cache
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Raw per-item results and large artifacts. Upload to CI artifacts instead.
+results/raw/
+results/*/raw/
+artifacts/
+*.jsonl
+!fixtures/*.jsonl
+
+# Python tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp

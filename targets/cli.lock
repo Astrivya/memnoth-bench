@@ -1,0 +1,11 @@
+{
+  "repository": "https://github.com/Astrivya/memnoth",
+  "commit": "df52a08",
+  "version": "0.1.2",
+  "validated_at": "2026-11-23",
+  "public_surface": {
+    "cli_json": "mn <verb> --json -> {ok, command, version, data, schema?}",
+    "mcp_stdio": "newline-delimited JSON-RPC; methods server/discover, initialize, tools/list, tools/call"
+  },
+  "note": "Internal lanes remain authoritative in CLI/. This harness only calls the public surface above. Update this lock when validating against a new CLI commit."
+}
