@@ -1,0 +1,22 @@
+{
+  "id": "amb-pmb-active-derived",
+  "lane": "amb-pmb",
+  "label": "AMB PrecisionMemBench retrieval: pinned active-tier belief-ID case pass (derived, Tier C)",
+  "value": "2/43",
+  "denominator": {
+    "n": 43,
+    "unit": "belief cases"
+  },
+  "ci": null,
+  "dataset_version": "b95d6abb471c0d591c440172283dd74e7af000df",
+  "judge_version": "none (judge-free retrieval)",
+  "provenance": "memnoth-bench/harnesses/amb/adapter.py; runner: memnoth-bench/runner/amb_run.py; pins: memnoth-bench/harnesses/amb/README.md",
+  "metric_definition": "local belief-ID case pass on the pinned active tier of the PMB single-turn retrieval lane; no answer model, no judge",
+  "observed_date": "2026-11-24",
+  "observed_at": "2026-11-24T16:12:33Z",
+  "official": false,
+  "diagnostic": "derived",
+  "note": "INFORMATIONAL ONLY — derived Tier C diagnostic of active-tier belief-ID retrieval on the pinned 77-case PMB lane; no rank, no win, no official score asserted; published AMB rows are vendor self-reports on different harnesses and are not comparable.",
+  "comparability_tier": "C",
+  "score_asserted": false
+}
