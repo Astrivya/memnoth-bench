@@ -208,6 +208,24 @@ _NUMERIC_GOLD = re.compile(r"^\d{4,}$")
 _NUMERIC_CANDIDATE = re.compile(r"\b\d{4,}\b")
 
 
+def extract_needle_key(question: str) -> str | None:
+    """Return the embedded RULER needle key from a question, gold-free.
+
+    ``niah_single_1`` questions embed the magic key in a fixed sentence, e.g.
+    ``"What is the special magic number for quiet-lantern mentioned in the
+    provided text?"``. Only the question string is inspected; gold answers are
+    never read or searched for. Returns ``None`` when the known template does
+    not match, so callers can refuse rather than fabricate a query.
+    """
+    if not isinstance(question, str):
+        return None
+    match = _QUESTION_RE.search(question)
+    if match is None:
+        return None
+    key = match.group("key").strip()
+    return key or None
+
+
 # --------------------------------------------------------------------------- #
 # Pins, validation, preparation
 # --------------------------------------------------------------------------- #
@@ -444,7 +462,9 @@ def _parse_niah_row(record: dict[str, Any]) -> dict[str, Any] | None:
     if match is None:
         return None
     question = match.group(0).strip()
-    key = match.group("key").strip()
+    key = extract_needle_key(question)
+    if key is None:
+        return None
     before = user_part[: match.start()]
     lines = [line.strip() for line in before.splitlines()]
     try:
@@ -487,7 +507,11 @@ def build_rows(
 
     Each case carries ``chunks`` (deterministic groups of intact haystack
     lines) and ``entities`` (stable ids ``ruler_<len>_<index>_<chunk>``). The
-    ``query`` is the RULER question (key only); gold is never included.
+    ``query`` is the gold-free needle key extracted from the RULER question:
+    ``mn vault recall`` uses token-AND matching, so the full question sentence
+    (e.g. "What is the special magic number for quiet-lantern mentioned in the
+    provided text?") matches zero entities even when the key is seeded. Gold
+    is never included.
     """
     if not isinstance(chunk_lines, int) or chunk_lines < 1:
         raise ValueError("chunk_lines must be a positive int")
@@ -520,7 +544,7 @@ def build_rows(
                 "task": task,
                 "length": length,
                 "key": parsed["key"],
-                "query": parsed["question"],
+                "query": extract_needle_key(parsed["question"]) or parsed["key"],
                 "context": parsed["context"],
                 "context_lines": len(lines),
                 "chunks": chunks,
@@ -709,11 +733,20 @@ def self_test() -> dict[str, Any]:
     assert validation["verified_pins"] == ["niah_single_1:4k"]
     assert len(validation["refused_pins"]) == 5
 
+    # Gold-free extractor assertion: the key is pulled from the question text
+    # alone. No gold answer is supplied to, or searched by, the extractor.
+    probe_question = (
+        "What is the special magic number for brisk-orbit mentioned in the provided text?"
+    )
+    assert extract_needle_key(probe_question) == "brisk-orbit"
+    assert extract_needle_key("no magic key here") is None
+
     synthetic = _synthetic_parquet_rows()
     rows = build_rows(synthetic, max_cases=2)
     assert len(rows) == 2, "both synthetic rows must parse"
     for row in rows:
-        assert row["query"].startswith("What is the special magic number for ")
+        assert "What is" not in row["query"], "full question must not be the recall query"
+        assert row["query"] == row["key"], "recall query must be the extracted needle key"
         assert row["answer"] not in row["query"], "gold leaked into the recall query"
         assert any(row["answer"] in chunk for chunk in row["chunks"]), "needle lost in chunking"
         assert len(row["entities"]) == len(row["chunks"])
