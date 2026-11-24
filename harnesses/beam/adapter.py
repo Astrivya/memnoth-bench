@@ -33,6 +33,7 @@ import re
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -179,6 +180,13 @@ READER_BASE_URL = "https://ai-gateway.kilo.ai/api/v1"
 JUDGE_BASE_URL = "https://ai-gateway.kilo.ai/api/v1"
 ANSWER_SOURCE = "reader over CLI-recalled facts"
 
+# The runner formats the whole pinned conversation (millions of characters) and
+# the reader has a 1M-token window. A hard 12k-character slice discarded >99% of
+# the evidence and caused blanket UNSUPPORTED. Reader-side evidence selection is
+# bounded instead, and every character it sees still comes from conversation
+# facts (never from gold, rubric or annotations).
+READER_CONTEXT_CHARS = 90_000
+
 READER: dict[str, Any] = {
     "model": READER_MODEL,
     "provider": READER_PROVIDER,
@@ -211,13 +219,18 @@ RETRIEVAL_PROFILE: dict[str, Any] = {
     "chronological_evidence_layout": True,
     "atomic_facts_with_speaker_and_timestamp": True,
     "hybrid_recall_rrf_rerank": True,
-    "top_k": 15,
+    # None = render every supplied fact. The runner calls format_context without
+    # a question, so reader_call performs the question-conditioned selection.
+    "top_k": None,
     "multi_query_decomposition": True,
     "sufficiency_check": True,
     "temporal_invalidation_versioned_facts": True,
     "note": (
-        "Retrieval itself lives in the CLI harness. This adapter freezes the "
-        "profile and formats only the facts it is given; it performs no recall."
+        "Retrieval itself lives in the CLI harness. format_context renders the "
+        "facts it is given (top_k=None means all of them); reader_call then "
+        "selects question-relevant fact lines under READER_CONTEXT_CHARS. The "
+        "runner passes no question to format_context, so selection has to happen "
+        "at the reader boundary. No gold or rubric text is ever in scope."
     ),
 }
 
@@ -358,6 +371,74 @@ def rrf_fuse(ranked_lists: Sequence[Sequence[Any]], *, k: int = 60) -> list[Any]
     return [items[key] for key in sorted(scores, key=lambda value: (-scores[value], value))]
 
 
+_DATE_FORMATS = ("%B-%d-%Y", "%b-%d-%Y", "%Y-%m-%d", "%B %d, %Y")
+_READER_STOPWORDS = frozenset(
+    "a an and are as at be by can could did do does for from had has have how i if in "
+    "into is it its me my of on or our say so that the their them then there these they "
+    "this to was were what when where which who why will with you your about tell more "
+    "like only mention items".split()
+)
+
+
+def _time_sort_key(fact: dict[str, Any]) -> tuple[int, float, str]:
+    """Sort parsed absolute dates oldest-first; undated facts go last.
+
+    BEAM turns carry a date on the first turn of each session only; an empty
+    anchor must not sort ahead of real dates (it used to, because "" < "March").
+    """
+    fact = fact if isinstance(fact, dict) else {}
+    raw = str(fact.get("time_anchor") or fact.get("valid_from") or "").strip()
+    if not raw:
+        return (1, 0.0, raw)
+    for fmt in _DATE_FORMATS:
+        try:
+            return (0, datetime.strptime(raw, fmt).timestamp(), raw)
+        except ValueError:
+            continue
+    return (0, float("inf"), raw)
+
+
+def _terms(text: Any) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", str(text or "").casefold())
+        if len(token) > 2 and token not in _READER_STOPWORDS
+    }
+
+
+def _select_evidence(question: str, context: str, max_chars: int = READER_CONTEXT_CHARS) -> str:
+    """Pick question-relevant conversation-fact lines, then restore their order.
+
+    This is lexical evidence selection over the *already formatted conversation
+    facts*. It never sees gold, rubric or annotations, and it never adds text of
+    its own: every returned line is a verbatim line from ``context``. When no
+    line has any question-term overlap, it returns a neutral prefix instead of
+    inventing a hit -- a genuinely unsupported question still gets UNSUPPORTED
+    from the unchanged reader abstention rule.
+    """
+    lines = [line for line in str(context or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    question_terms = _terms(question)
+    if not question_terms:
+        return "\n".join(lines)[:max_chars]
+    scored = [(len(question_terms & _terms(line)), position, line) for position, line in enumerate(lines)]
+    if not any(score > 0 for score, _position, _line in scored):
+        return "\n".join(lines)[:max_chars]
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    picked: list[tuple[int, str]] = []
+    total = 0
+    for score, position, line in scored:
+        if not picked and score == 0:
+            break
+        if picked and (score == 0 or total + len(line) + 1 > max_chars):
+            break
+        picked.append((position, line))
+        total += len(line) + 1
+    picked.sort(key=lambda item: item[0])
+    return "\n".join(line for _position, line in picked)
+
+
 def format_context(
     facts: Sequence[dict[str, Any]],
     *,
@@ -370,11 +451,12 @@ def format_context(
     Versioned facts may carry ``valid_from``/``valid_to``; superseded intervals
     are marked so the reader can apply temporal invalidation. Ordering is by
     absolute time anchor when requested, otherwise by the caller's rank.
+    ``top_k=None`` renders every supplied fact (the runner passes all fused
+    conversation turns); reader_call narrows them to question-relevant evidence.
     """
-    limit = int(top_k or 15)
-    selected = list(facts)[:limit]
+    selected = list(facts) if not top_k else list(facts)[: int(top_k)]
     if chronological:
-        selected.sort(key=lambda item: str(item.get("time_anchor") or item.get("valid_from") or ""))
+        selected.sort(key=_time_sort_key)
     lines: list[str] = []
     for fact in selected:
         if not isinstance(fact, dict):
@@ -404,8 +486,9 @@ def reader_call(
     """OpenAI-compatible reader call. Returns (answer, error_code), never logs.
 
     Pass a key obtained from ``KeyPool.get()``; this function stores none. The
-    prompt contains only the question and recalled context -- no ideal answer,
-    rubric, or annotation.
+    prompt contains only the question and question-relevant conversation-fact
+    excerpts -- no ideal answer, rubric, or annotation. The bare-UNSUPPORTED
+    abstention rule in the system prompt is unchanged.
     """
     call = opener or urllib.request.urlopen
     payload = {
@@ -421,7 +504,14 @@ def reader_call(
                     "the facts, say UNSUPPORTED."
                 ),
             },
-            {"role": "user", "content": f"Question: {str(question)[:4000]}\nFacts:\n{context[:12000]}"},
+            {
+                "role": "user",
+                "content": (
+                    f"Question: {str(question)[:4000]}\n"
+                    f"Facts (question-relevant excerpts from the conversation):\n"
+                    f"{_select_evidence(question, context)}"
+                ),
+            },
         ],
         "temperature": 0,
         "max_tokens": 1024,
@@ -886,6 +976,43 @@ def self_test() -> dict[str, Any]:
         ]
     )
     assert "[2024-03-01] Ada:" in context and "[superseded 2024-01-01]" in context
+
+    # Full-conversation rendering + question-conditioned evidence selection.
+    all_facts = [
+        {"content": "unrelated cooking notes", "speaker": "Bob", "time_anchor": "2024-06-01"},
+        {"content": "studied psychology at Cambridge", "speaker": "Ada", "time_anchor": "2024-03-01"},
+        {"content": "another unrelated item", "speaker": "Bob", "time_anchor": "2024-07-01"},
+    ]
+    full = format_context(all_facts, top_k=None, chronological=True)
+    assert len(full.splitlines()) == 3
+    assert full.index("studied psychology") < full.index("unrelated cooking")
+    evidence = _select_evidence("Where did Ada study psychology?", full, max_chars=500)
+    assert "studied psychology" in evidence and "unrelated cooking" not in evidence
+    neutral = _select_evidence("quantum physics", full, max_chars=500)
+    assert neutral.startswith("- [2024-03-01] Ada:")  # neutral prefix, no invented hit
+
+    class _Response:
+        def __enter__(self) -> "_Response":
+            return self
+
+        def __exit__(self, *_args: Any) -> bool:
+            return False
+
+        def read(self) -> bytes:
+            return json.dumps({"choices": [{"message": {"content": "a real answer"}}]}).encode("utf-8")
+
+    captured: dict[str, Any] = {}
+
+    def _reader_opener(request: Any, timeout: float | None = None) -> _Response:
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        return _Response()
+
+    answer, reader_error = reader_call(
+        "Where did Ada study psychology?", full, api_key="unused", opener=_reader_opener
+    )
+    assert (answer, reader_error) == ("a real answer", None)
+    assert "studied psychology" in captured["payload"]["messages"][1]["content"]
+    assert "unrelated cooking" not in captured["payload"]["messages"][1]["content"]
 
     synthetic_record = {
         "conversation_id": "c1",
