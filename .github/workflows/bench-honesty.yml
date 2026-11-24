@@ -1,0 +1,36 @@
+# Honesty gate for the public benchmark repo. Structural checks only: no keys,
+# no secrets, no provider/model calls, no writes to the tree. Runs on every push
+# and PR, including fork PRs, so the gate cannot be bypassed by a fork.
+
+name: bench-honesty
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  honesty-gate:
+    name: no fake scores / private leaks / attribution
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout (full history for commit-message scan)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Stdlib unittest only. No pip install, no API keys, no network calls.
+      - name: Run honesty + transport tests
+        run: python -m unittest tests.test_honesty tests.test_transport -v
