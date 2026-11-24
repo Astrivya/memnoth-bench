@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -440,6 +441,636 @@ def mcp_stdio_result(
     return result
 
 
+# --------------------------------------------------------------------------- #
+# Pinned external lanes -- real adapter wiring
+# --------------------------------------------------------------------------- #
+
+LANE_MODULES: dict[str, str] = {
+    "memoryagentbench-mh": "harnesses.memoryagentbench.adapter",
+    "longmemeval-temporal": "harnesses.longmemeval.adapter",
+    "locomo-small": "harnesses.locomo.adapter",
+}
+
+# Repo-relative paths only; prepare() itself enforces the SHA-256 pin.
+DATASET_REL: dict[str, str] = {
+    "memoryagentbench-mh": "data/memoryagentbench/Conflict_Resolution-00000-of-00001.parquet",
+    "longmemeval-temporal": "data/longmemeval/longmemeval_oracle.json",
+    "locomo-small": "data/locomo/locomo_conversation.json",
+}
+
+_SERIAL = re.compile(r"serial\s+(\d+)", re.IGNORECASE)
+
+
+class LaneBlocked(RuntimeError):
+    """A pinned lane cannot run; report it, never substitute a score."""
+
+
+def adapter_for(lane: str):
+    return importlib.import_module(LANE_MODULES[lane])
+
+
+def _strip_percent_literals(value: Any) -> Any:
+    """Keep the verify contract: no percent sign survives into a result."""
+    if isinstance(value, str):
+        return no_bare_percentages(value).replace("%", " percent")
+    if isinstance(value, dict):
+        return {key: _strip_percent_literals(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_strip_percent_literals(item) for item in value]
+    return value
+
+
+def prepare_for_lane(lane: str, *, dry_run: bool) -> dict[str, Any]:
+    """Exercise prepare() without network in dry-run (cached artifact only)."""
+    module = adapter_for(lane)
+    artifact = DATASET_REL[lane]
+    cached = ROOT / artifact
+    if dry_run:
+        if not cached.is_file():
+            return {
+                "status": "skipped_dry_run",
+                "artifact": artifact,
+                "reason": "no cached artifact; --dry-run never uses the network",
+            }
+        try:
+            path = module.prepare()  # cache hit: fetch_pinned re-hashes, no download
+        except Exception as exc:
+            return {
+                "status": "blocked",
+                "artifact": artifact,
+                "reason": f"cached prepare failed: {type(exc).__name__}",
+            }
+        return {
+            "status": "cached_prepare_ok",
+            "artifact": artifact,
+            "sha256": sha256_file(path),
+        }
+    try:
+        path = module.prepare()
+    except Exception as exc:
+        raise LaneBlocked(f"dataset preparation failed: {type(exc).__name__}: {exc}") from None
+    return {"status": "prepared", "artifact": artifact, "sha256": sha256_file(path)}
+
+
+def load_dataset(lane: str) -> Any:
+    """Load the SHA-verified artifact with stdlib JSON, or optional pyarrow."""
+    path = ROOT / DATASET_REL[lane]
+    if not path.is_file():
+        raise LaneBlocked(f"verified dataset artifact is missing: {DATASET_REL[lane]}")
+    if path.suffix == ".json":
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise LaneBlocked(f"cannot read dataset JSON: {type(exc).__name__}") from None
+    try:
+        import pyarrow.parquet as pq  # type: ignore[import-not-found]
+    except ImportError:
+        raise LaneBlocked(
+            "local parquet reader unavailable; install pyarrow locally for the real "
+            "MemoryAgentBench lane or use --dry-run (stdlib-only)"
+        ) from None
+    try:
+        return pq.read_table(path).to_pylist()
+    except Exception as exc:
+        raise LaneBlocked(f"cannot read dataset parquet: {type(exc).__name__}") from None
+
+
+def _entity_name(value: Any) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value)).strip("-")[:120] or "entity"
+
+
+_STOPWORDS = {
+    "the", "and", "for", "was", "were", "what", "when", "where", "who", "with",
+    "that", "this", "from", "have", "had", "has", "did", "does", "how", "why",
+    "about", "into", "its", "our", "your", "their", "they", "then", "than",
+    "after", "before", "first", "last", "been", "are", "not", "you", "his", "her",
+}
+
+
+def _keyword_query(text: str, limit: int = 8) -> str:
+    """Short FTS-friendly query: the public recall path ranks entity names."""
+    tokens = re.findall(r"[A-Za-z][A-Za-z'-]{2,}", str(text or "").lower())
+    return " ".join(token for token in tokens if token not in _STOPWORDS)[:200] or str(text)[:200]
+
+
+def _slug(text: str, max_words: int = 6) -> str:
+    words = re.findall(r"[A-Za-z0-9]+", str(text or ""))[:max_words]
+    return "-".join(word.lower() for word in words)[:60]
+
+
+def _match_known(name: str, known: list[str]) -> str | None:
+    """Map a recalled entity name back to one of the seeded pinned IDs."""
+    candidate = _entity_name(name)
+    for value in known:
+        needle = _entity_name(value)
+        if needle and (candidate == needle or candidate.startswith(needle + "-") or needle in candidate):
+            return value
+    return None
+
+
+def _vault_remember(bin_path: Path | None, cli_root: Path | None, vault: Path, entity: str, text: str) -> bool:
+    result = mn_json.run_verb(
+        "vault",
+        ["remember", _entity_name(entity), text[:2000], "--vault", str(vault)],
+        bin_path,
+        timeout=30.0,
+        cwd=cli_root,
+    )
+    return bool(result.get("ok")) and "error" not in result
+
+
+def _vault_recall(
+    bin_path: Path | None, cli_root: Path | None, vault: Path, query: str, limit: int
+) -> list[str]:
+    result = mn_json.run_verb(
+        "vault",
+        ["recall", query[:2000], "--limit", str(limit), "--vault", str(vault)],
+        bin_path,
+        timeout=30.0,
+        cwd=cli_root,
+    )
+    if not result.get("ok") or "error" in result:
+        return []
+    hits = (result.get("data") or {}).get("hits") or []
+    names: list[str] = []
+    for hit in hits:
+        if isinstance(hit, dict):
+            name = hit.get("name") or hit.get("canonical_name")
+            if name:
+                names.append(str(name))
+    return names
+
+
+def _recall_question(
+    bin_path: Path | None, cli_root: Path | None, vault: Path, question: str, limit: int
+) -> list[str]:
+    """Recall with the question, then progressively shorter FTS keyword forms.
+
+    The public recall verb is a token-AND search; a long natural-language
+    question often matches nothing. Shorter real queries are still observations
+    from the public surface, not synthesized answers.
+    """
+    ranked = _vault_recall(bin_path, cli_root, vault, question, limit)
+    if ranked:
+        return ranked
+    terms = [token for token in _keyword_query(question).split() if token]
+    queries: list[str] = []
+    if terms:
+        queries.append(" ".join(terms))
+    for count in (3, 2, 1):
+        if len(terms) >= count:
+            queries.append(" ".join(terms[:count]))
+    for term in terms[:6]:
+        queries.append(term)
+    seen: set[str] = set()
+    found: list[str] = []
+    for query in queries:
+        for name in _vault_recall(bin_path, cli_root, vault, query, limit):
+            if name not in seen:
+                seen.add(name)
+                found.append(name)
+        if found:
+            break
+    return found
+
+
+def _vault_asof(
+    bin_path: Path | None, cli_root: Path | None, vault: Path, entity: str
+) -> list[str]:
+    result = mn_json.run_verb(
+        "vault",
+        ["asof", "--name", _entity_name(entity), "--vault", str(vault)],
+        bin_path,
+        timeout=30.0,
+        cwd=cli_root,
+    )
+    if not result.get("ok") or "error" in result:
+        return []
+    facts = (result.get("data") or {}).get("facts") or []
+    return [str(fact.get("content")) for fact in facts if isinstance(fact, dict)]
+
+
+def _mab_facts(context: Any) -> list[tuple[int, str]]:
+    facts: list[tuple[int, str]] = []
+    for line in str(context or "").splitlines():
+        match = re.match(r"\s*(\d+)\.\s+(.*\S)\s*$", line)
+        if match:
+            facts.append((int(match.group(1)), match.group(2)))
+    return facts
+
+
+def _answer_in_fact(answer: Any, fact_text: str) -> bool:
+    needle = " ".join(str(answer or "").split()).casefold()
+    return bool(needle) and needle in " ".join(fact_text.split()).casefold()
+
+
+def _build_mab_rows(
+    selection: dict[str, Any],
+    dataset: Any,
+    bin_path: Path | None,
+    cli_root: Path | None,
+) -> tuple[list[dict[str, Any]], int, list[str]]:
+    """Drive the vault with the pinned true/rewrite pair for each configuration."""
+    by_subset: dict[str, list[dict[str, Any]]] = {"SH": [], "MH": []}
+    for record in dataset if isinstance(dataset, list) else []:
+        if not isinstance(record, dict):
+            continue
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        source = str(record.get("source") or metadata.get("source") or "").lower()
+        for subset in by_subset:
+            if f"factconsolidation_{subset.lower()}_" in source:
+                by_subset[subset].append(record)
+    for records in by_subset.values():
+        records.sort(key=lambda item: str(item.get("source")))
+
+    rows: list[dict[str, Any]] = []
+    failures: list[str] = []
+    attempted = 0
+    counters = {"SH": 0, "MH": 0}
+    for configuration in selection.get("configurations", []):
+        if not isinstance(configuration, dict):
+            continue
+        attempted += 1
+        subset = str(configuration.get("subset") or "").upper()
+        candidates = by_subset.get(subset, [])
+        if not candidates:
+            failures.append(f"{subset}: no pinned dataset row")
+            continue
+        position = counters[subset] % len(candidates)
+        counters[subset] = position + 1
+        record = candidates[position]
+        facts = _mab_facts(record.get("context"))
+        questions = record.get("questions") or []
+        answers = record.get("answers") or []
+        if not facts or not questions:
+            failures.append(f"{subset}: no facts or questions in pinned row")
+            continue
+        ordinal = int(configuration.get("ordinal") or 1)
+        question_index = (ordinal - 1) % len(questions)
+        gold_answers = answers[question_index] if question_index < len(answers) else []
+        if not isinstance(gold_answers, list):
+            gold_answers = [gold_answers]
+        matching = [
+            serial
+            for serial, text in facts
+            if any(_answer_in_fact(answer, text) for answer in gold_answers)
+        ]
+        if len(matching) < 2:
+            failures.append(f"{subset}: fewer than two answer-bearing facts")
+            continue
+        older_serial, newer_serial = sorted(matching)[-2:]
+        older_text = dict(facts)[older_serial]
+        newer_text = dict(facts)[newer_serial]
+        case_id = f"fc-{subset.lower()}-{ordinal}-{question_index + 1}"
+        with tempfile.TemporaryDirectory(prefix="mn-bench-mab-") as temporary:
+            vault = Path(temporary) / "vault.db"
+            writes_ok = _vault_remember(
+                bin_path, cli_root, vault, case_id, f"serial {older_serial}: {older_text}"
+            ) and _vault_remember(
+                bin_path, cli_root, vault, case_id, f"serial {newer_serial}: {newer_text}"
+            )
+            observed = _vault_asof(bin_path, cli_root, vault, case_id) if writes_ok else []
+        if not observed:
+            failures.append(f"{case_id}: no recall observation")
+            continue
+        match = _SERIAL.search(observed[-1])
+        if match is None:
+            failures.append(f"{case_id}: recalled fact had no serial")
+            continue
+        rows.append(
+            {
+                "case_id": case_id,
+                "subset": subset,
+                "context_tokens": int(configuration.get("context_tokens") or 4096),
+                "update_type": "rewrite" if older_serial != newer_serial else "true",
+                "gold_serial": str(newer_serial),
+                "pred_serial": match.group(1),
+                "gold_answer": " ".join(str(item) for item in gold_answers)[:300],
+                "pred_answer": observed[-1][:300],
+                "gold_derivation": "largest pinned fact index containing a gold answer",
+            }
+        )
+    return rows, attempted, failures
+
+
+def _build_lme_rows(
+    selection: dict[str, Any],
+    dataset: Any,
+    bin_path: Path | None,
+    cli_root: Path | None,
+) -> tuple[list[dict[str, Any]], int, list[str]]:
+    module = adapter_for("longmemeval-temporal")
+    question_type = getattr(module, "QUESTION_TYPE_FILTER", "temporal-reasoning")
+    records = [
+        item for item in dataset if isinstance(item, dict) and item.get("question_type") == question_type
+    ]
+    records.sort(key=lambda item: str(item.get("question_id")))
+    wanted_ids = [str(value) for value in (selection.get("ids") or [])]
+    if wanted_ids:
+        by_id = {str(item.get("question_id")): item for item in records}
+        selected = [by_id[value] for value in wanted_ids if value in by_id]
+    else:
+        selected = records[: int(selection.get("effective_denominator") or 0)]
+
+    rows: list[dict[str, Any]] = []
+    failures: list[str] = []
+    attempted = 0
+    for record in selected:
+        attempted += 1
+        question_id = str(record.get("question_id") or "")
+        session_ids = [
+            str(value) for value in (record.get("haystack_session_ids") or []) if value is not None
+        ]
+        sessions = record.get("haystack_sessions") or []
+        if not question_id or not session_ids:
+            failures.append(f"{question_id}: missing question or session IDs")
+            continue
+        with tempfile.TemporaryDirectory(prefix="mn-bench-lme-") as temporary:
+            vault = Path(temporary) / "vault.db"
+            writes_ok = True
+            for index, session_id in enumerate(session_ids):
+                turns = sessions[index] if index < len(sessions) else []
+                text = " ".join(
+                    str(turn.get("content") or "")
+                    for turn in turns
+                    if isinstance(turn, dict) and turn.get("role") == "user"
+                )
+                if not text.strip():
+                    text = " ".join(str(turn.get("content") or "") for turn in turns if isinstance(turn, dict))
+                entity = f"{session_id}-{_slug(text)}"
+                writes_ok = _vault_remember(bin_path, cli_root, vault, entity, text or session_id) and writes_ok
+            ranked = _recall_question(bin_path, cli_root, vault, str(record.get("question") or ""), 10) if writes_ok else []
+        matched: list[str] = []
+        for name in ranked:
+            session_id = _match_known(name, session_ids)
+            if session_id is not None and session_id not in matched:
+                matched.append(session_id)
+        ranked = matched
+        if not ranked:
+            failures.append(f"{question_id}: no recall observation")
+            continue
+        rows.append(
+            {
+                "question_id": question_id,
+                "question_type": question_type,
+                "answer_session_ids": [str(value) for value in (record.get("answer_session_ids") or [])],
+                "retrieved_session_ids": ranked,
+                "answer": str(record.get("answer") or "")[:300],
+            }
+        )
+    return rows, attempted, failures
+
+
+def _build_locomo_rows(
+    selection: dict[str, Any],
+    dataset: Any,
+    bin_path: Path | None,
+    cli_root: Path | None,
+) -> tuple[list[dict[str, Any]], int, list[str]]:
+    conversations = [item for item in dataset if isinstance(item, dict)] if isinstance(dataset, list) else []
+    if not conversations:
+        return [], 0, ["no pinned conversation"]
+    record = conversations[0]
+    conversation = record.get("conversation") if isinstance(record.get("conversation"), dict) else record
+    sessions: dict[str, list[Any]] = {
+        key: value
+        for key, value in conversation.items()
+        if key.startswith("session_") and isinstance(value, list)
+    }
+    questions = [item for item in (record.get("qa") or []) if isinstance(item, dict)]
+    wanted = int(selection.get("effective_denominator") or 0)
+    selected = questions[:wanted]
+
+    rows: list[dict[str, Any]] = []
+    failures: list[str] = []
+    attempted = 0
+    with tempfile.TemporaryDirectory(prefix="mn-bench-locomo-") as temporary:
+        vault = Path(temporary) / "vault.db"
+        writes_ok = True
+        entity_by_session: dict[str, str] = {}
+        for session_id, turns in sessions.items():
+            text = " ".join(
+                f"{turn.get('speaker') or ''}: {turn.get('text') or ''}"
+                for turn in turns
+                if isinstance(turn, dict)
+            )
+            entity = f"{session_id}-{_slug(text)}"
+            entity_by_session[session_id] = entity
+            writes_ok = _vault_remember(bin_path, cli_root, vault, entity, text or session_id) and writes_ok
+        for index, question in enumerate(selected):
+            attempted += 1
+            question_id = f"locomo-1-{index + 1}"
+            if not writes_ok:
+                failures.append(f"{question_id}: vault seed failed")
+                continue
+            hits = _recall_question(bin_path, cli_root, vault, str(question.get("question") or ""), 5)
+            ranked: list[str] = []
+            for name in hits:
+                session_id = _match_known(name, list(sessions))
+                if session_id is not None and session_id not in ranked:
+                    ranked.append(session_id)
+            if not ranked:
+                failures.append(f"{question_id}: no recall observation")
+                continue
+            facts = _vault_asof(bin_path, cli_root, vault, entity_by_session[ranked[0]])
+            if not facts or not str(facts[-1]).strip():
+                failures.append(f"{question_id}: no recalled content")
+                continue
+            rows.append(
+                {
+                    "question_id": question_id,
+                    "gold_answer": str(question.get("answer") or "")[:300],
+                    "pred_answer": facts[-1][:500],
+                    "answer_source": "vault-recall (no generation model)",
+                    "retrieved_session_ids": ranked,
+                }
+            )
+    return rows, attempted, failures
+
+
+ROW_BUILDERS = {
+    "memoryagentbench-mh": _build_mab_rows,
+    "longmemeval-temporal": _build_lme_rows,
+    "locomo-small": _build_locomo_rows,
+}
+
+
+def _synthetic_rows(lane: str, selection: dict[str, Any]) -> list[dict[str, Any]]:
+    """Clearly labelled synthetic rows for offline wiring checks only."""
+    if lane == "memoryagentbench-mh":
+        configurations = [item for item in selection.get("configurations", []) if isinstance(item, dict)]
+        return [
+            {
+                "case_id": f"dry-fc-{index + 1}",
+                "subset": str(item.get("subset") or "MH").upper(),
+                "context_tokens": int(item.get("context_tokens") or 4096),
+                "update_type": "rewrite",
+                "gold_serial": f"S-{index + 1}",
+                "pred_serial": f"S-{index + 1}" if index % 2 == 0 else "S-stale",
+                "gold_answer": f"synthetic answer {index + 1}",
+                "pred_answer": f"synthetic answer {index + 1}",
+            }
+            for index, item in enumerate(configurations)
+        ]
+    count = int(selection.get("effective_denominator") or 0)
+    if lane == "longmemeval-temporal":
+        ids = [str(value) for value in (selection.get("ids") or [])]
+        return [
+            {
+                "question_id": ids[index] if index < len(ids) else f"dry-q-{index + 1}",
+                "question_type": "temporal-reasoning",
+                "answer_session_ids": [f"s{index + 1}"],
+                "retrieved_session_ids": [f"s{index + 1}"] if index % 2 == 0 else ["s-other"],
+                "answer": "synthetic answer",
+            }
+            for index in range(count)
+        ]
+    return [
+        {
+            "question_id": f"dry-locomo-{index + 1}",
+            "gold_answer": "synthetic answer",
+            "pred_answer": "synthetic answer" if index % 2 == 0 else "synthetic other",
+        }
+        for index in range(count)
+    ]
+
+
+def model_lane_result(
+    *,
+    lane: str,
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    args: argparse.Namespace,
+    bin_path: Path | None,
+    cli_root: Path | None,
+) -> dict[str, Any]:
+    """Run one pinned lane through its adapter and the public CLI surface."""
+    module = adapter_for(lane)
+    dry_run = bool(args.dry_run)
+    common: dict[str, Any] = {
+        "lane": lane,
+        "run_id": manifest["run_id"],
+        "manifest_path": str(manifest_path.relative_to(ROOT)),
+        "manifest_sha256": sha256_file(manifest_path),
+        "mode": "dry_run" if dry_run else "real",
+        "cases": [],
+        "cases_synthetic": dry_run,
+        "judge_fn": None,
+    }
+    try:
+        preparation = prepare_for_lane(lane, dry_run=dry_run)
+        selection = module.select(args.max_cases)
+    except (LaneBlocked, ValueError, OSError) as exc:
+        result = base_envelope(SCHEMA_RESULT, **common)
+        result.update(
+            {
+                "status": "blocked",
+                "gate": "fail",
+                "reason": mn_json.redact(str(exc)),
+                "denominators": denominators_for(lane, manifest.get("pins")),
+                "limitation": "No score is asserted for a lane that could not be prepared.",
+            }
+        )
+        return result
+
+    total = int(selection.get("effective_denominator") or 0)
+    if dry_run:
+        rows = _synthetic_rows(lane, selection)
+        attempted, failures = len(rows), []
+    else:
+        try:
+            dataset = load_dataset(lane)
+        except LaneBlocked as exc:
+            result = base_envelope(SCHEMA_RESULT, **common)
+            result.update(
+                {
+                    "status": "blocked",
+                    "gate": "fail",
+                    "reason": str(exc),
+                    "preparation": preparation,
+                    "selection": {
+                        "effective_denominator": total,
+                        "planned_denominator": selection.get("planned_denominator"),
+                    },
+                    "denominators": {
+                        "cases_total": total,
+                        "cases_attempted": 0,
+                        "cases_scored": 0,
+                        "cases_failed": 0,
+                        "official_split": False,
+                    },
+                    "limitation": "No dataset read, no score asserted.",
+                }
+            )
+            return result
+        rows, attempted, failures = ROW_BUILDERS[lane](selection, dataset, bin_path, cli_root)
+
+    evaluation = module.evaluate(rows, judge_fn=None)
+    # Synthetic rows are observations of the wiring, not of the product.
+    scored = 0 if dry_run else (len(rows) if not failures else 0)
+    case_records = [
+        {
+            "case_id": str(
+                row.get("case_id") or row.get("question_id") or f"case-{index + 1}"
+            ),
+            "observed": True,
+            "synthetic": dry_run,
+        }
+        for index, row in enumerate(rows)
+    ]
+    case_records.extend(
+        {"case_id": f"failed-{index + 1}", "observed": False, "reason": reason}
+        for index, reason in enumerate(failures)
+    )
+
+    result = base_envelope(SCHEMA_RESULT, **common)
+    result.update(
+        {
+            "status": "ok" if (dry_run or (attempted > 0 and scored > 0)) else "fail",
+            "gate": "ok" if (dry_run or (attempted > 0 and scored > 0)) else "fail",
+            "preparation": preparation,
+            "selection": {
+                "effective_denominator": total,
+                "planned_denominator": selection.get("planned_denominator"),
+                "official_split": bool(selection.get("official_split", False)),
+                "ids_pinned": bool(selection.get("ids_pinned", False)),
+                "max_cases": args.max_cases,
+            },
+            "harness": {
+                "module": LANE_MODULES[lane],
+                "dataset_url": getattr(module, "DATASET_URL", None),
+                "dataset_sha256": getattr(module, "DATASET_SHA256", None),
+            },
+            "cases": case_records,
+            "denominators": {
+                "cases_total": total,
+                "cases_attempted": attempted,
+                "cases_scored": scored,
+                "cases_failed": len(failures),
+                "evaluated_rows": int(evaluation.get("denominator") or 0),
+                "official_split": False,
+            },
+            "evaluation": _strip_percent_literals(evaluation),
+            "score_asserted": bool(scored > 0 and not dry_run),
+        }
+    )
+    if not dry_run and scored > 0 and attempted == scored:
+        result["score"] = evaluation.get("correct")
+        result["score_denominator"] = evaluation.get("denominator")
+    if dry_run:
+        result["limitation"] = (
+            "Synthetic rows exercise prepare/select/evaluate wiring only. No product "
+            "observation, no dataset bytes, no keys, no spend; not a score."
+        )
+    elif failures:
+        result["limitation"] = (
+            f"{len(failures)} of {attempted} attempted cases produced no real "
+            "observation; no score is asserted."
+        )
+        result["failure_reasons"] = failures[:20]
+    return result
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """Write a manifest first, then per-lane raw results. Never hide failures."""
     try:
@@ -447,6 +1078,17 @@ def cmd_run(args: argparse.Namespace) -> int:
     except (OSError, json.JSONDecodeError) as exc:
         print(f"cannot load pinned inputs: {exc}", file=sys.stderr)
         return 2
+
+    bin_path: Path | None = None
+    if getattr(args, "bin", None):
+        bin_path = Path(args.bin).expanduser()
+    else:
+        try:
+            bin_path = mn_json.discover_bin()
+        except FileNotFoundError:
+            bin_path = None
+    configured_root = resolve_cli_root(getattr(args, "cli_root", None))
+    cli_root = configured_root if configured_root.is_dir() else None
 
     run_date = datetime.now(timezone.utc).date().isoformat()
     any_failed = False
@@ -495,22 +1137,20 @@ def cmd_run(args: argparse.Namespace) -> int:
 
         denominators = denominators_for(lane, inputs["pins"])
         if lane in MODEL_LANES:
-            result = blocked_result(
+            result = model_lane_result(
                 lane=lane,
                 manifest=manifest,
                 manifest_path=manifest_path,
-                denominators=denominators,
-                reason=(
-                    "pinned external harness is not available in this checkout; "
-                    "no model calls were made and no score is asserted"
-                ),
+                args=args,
+                bin_path=bin_path,
+                cli_root=cli_root,
             )
         else:
             result = mcp_stdio_result(
                 manifest=manifest,
                 manifest_path=manifest_path,
                 denominators=denominators,
-                cli_root=resolve_cli_root(args.cli_root),
+                cli_root=cli_root,
             )
 
         result_path = expected_result_path
@@ -535,7 +1175,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             ),
         )
 
-        if result["status"] != "pass":
+        if result["status"] not in ("ok", "pass"):
             any_failed = True
         print(
             json.dumps(
@@ -811,6 +1451,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--lane", action="append", choices=ALL_RUN_LANES, required=True, help="lane name (repeatable)")
     run.add_argument("--confirm-spend", action="store_true", help="confirm BYOK model/judge spend")
     run.add_argument("--max-cases", type=int, default=None, help="cap cases attempted")
+    run.add_argument("--bin", default=None, help="path to mn (default: MN_BIN then discovery)")
+    run.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="exercise prepare/select/evaluate with synthetic rows; no network, keys, or spend",
+    )
     run.add_argument(
         "--cli-root",
         default=None,
